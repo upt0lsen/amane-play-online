@@ -1,5 +1,8 @@
 # amane-play-online
 
+> **实验功能**：真实 115 / 夸克 / WebDAV 各源的直链与本地回退链路尚未实测联调，
+> 联调验证前请勿用于重要场景。已知边界见下文「resolver 行为说明」与 PR 待确认问题。
+
 [Amane](https://github.com/sqzw-x/amane) 网盘挂载播放源插件：**直链直连 + 转码双通路**。
 
 输入与社区样本 `nas.local` 一致——条目已索引的**本地路径**（docker 挂载点）。片子物理上在
@@ -52,7 +55,6 @@ upt0lsen.play-online/
 | `address` | （空） | alist: `http://alist:5244`；webdav: `https://dav.xxx/dav`（到挂载根为止） |
 | `remote_prefix` | `/` | 后端内该挂载对应的起始路径，如 `/115` |
 | `token` | （空） | alist: AList 令牌；webdav: 密码。**只填运行配置，绝不入库** |
-| `username` | （空） | 仅 webdav 使用 |
 | `allow_direct` | `true` | 关闭后该挂载一律读本机路径（不走直链） |
 | `prefer_url_transcode` | `true` | 转码时 ffmpeg 优先读 http 直链，解析失败自动回退本地 |
 
@@ -62,8 +64,10 @@ upt0lsen.play-online/
 |---|---|---|
 | `direct_play` | `true` | 允许浏览器可解码的文件直连播放；关闭则一律转码 |
 | `ffmpeg_path` | （空） | 留空自动在 PATH / 插件数据目录 / Jellyfin / 常见位置查找 |
-| `ffmpeg_bundle_path` | （空） | 本机 ffmpeg 压缩包路径，找不到时自动解压部署 |
-| `ffmpeg_download_url` | （空） | 留空用内置国内镜像自动下载 |
+| `ffmpeg_bundle_path` | （空） | 本机 ffmpeg 压缩包路径，找不到时自动解压部署（无需 opt-in） |
+| `ffmpeg_download_url` | （空） | 固定版本下载地址（不要用 latest），与哈希配套 |
+| `allow_ffmpeg_download` | `false` | **默认关闭**。开启后仍须配置固定版本地址 + SHA-256，校验通过才执行 |
+| `ffmpeg_download_sha256` | （空） | 64 位十六进制；留空或非 64 位一律拒绝下载 |
 | `encoder` | auto | auto / nvenc / qsv / cpu |
 | `nvenc_codec` / `qsv_codec` | auto | 硬件编码家族内格式选择 |
 | `preset` | veryfast | 转码预设 |
@@ -73,13 +77,22 @@ upt0lsen.play-online/
 
 ### resolver 行为说明
 
-- **alist**：`POST {address}/api/fs/get`，body `{"path": "{remote_prefix下的路径"}`，取
+- **alist**：`POST {address}/api/fs/get`，body `{"path": "{remote_prefix 下的路径}"}`，取
   `data.raw_url`（签名直链），`data.url` 兜底。响应非 200 或网络失败 → 回退本机路径。
-- **webdav**：`{address}/{逐段转义的远端路径}`，有用户名/密码时加 Basic 认证头。
+  返回的 URL 必须是绝对 http(s)，否则拒绝（防篡改后把 `file://` 喂给 ffmpeg）。
+- **webdav**：`{address}/{逐段转义的远端路径}`；地址必须是绝对 http(s)；有用户名/密码时加
+  Basic 认证头。
+- **路径安全**：本地路径含 `.` / `..` 段一律不解析（回退本机），防止越出挂载点。
 - **直链 sign 时效**：不缓存解析结果，每次播放请求现签现跳；`UpstreamPlaybackTarget`
   不声明 `cache_ttl`。
+- **3xx 预检（重要）**：amane v0.28.0 的播放代理 `follow_redirects=False`，上游 3xx 一律
+  502。因此插件在返回直链前自己做重定向预检：跟随最多 5 跳，终点必须 200/206 且是媒体流
+  （错误页 Content-Type 判不可用）；预检不过自动回退本机路径，不把 3xx 甩给主机。
+- **凭据策略**：重定向**同源才带敏感头**——任何一跳 origin（scheme://host:port）变化，
+  立即剥离 `Authorization` 等敏感头再继续，不把 Basic/Bearer 转发给第三方域。
 - **302 说明**：amane SDK 的 `UpstreamPlaybackTarget` 是主机反代转发，不是浏览器直连的
   真 302；115/夸克 `/d/` 链接浏览器直访可行性**待实测**（见 PR 待确认问题）。
+- **非法 key**：`selected_key` 认不出时插件拒绝（`SourceError`），不会改播别的文件。
 
 ## 测试
 

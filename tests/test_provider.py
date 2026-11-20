@@ -75,7 +75,8 @@ class StubProvider(OnlineProvider):
     async def _codecs(self, path, tools):
         return self._stub_codecs.get(str(path))
 
-    async def _mount_target(self, path):
+    async def _verified_target(self, path):
+        """绕过真实网络预检: 桩直接返回预检后的目标."""
         if self._stub_mount_url is None:
             return None
         return MountTarget(url=self._stub_mount_url, headers={})
@@ -194,6 +195,19 @@ async def test_selected_key_picks_file(tmp_path) -> None:
         _query(_file(first), _file(second, file_id=2), selected_key="f2")
     )
     assert isinstance(target, UpstreamPlaybackTarget)
+
+
+@pytest.mark.asyncio
+async def test_illegal_selected_key_rejected(tmp_path) -> None:
+    """SDK 契约: 认不出的 key 必须拒绝, 不能改播别的文件 (萱儿复核项 2)."""
+    video = tmp_path / "a.mp4"
+    provider = _make_provider(tmp_path, mount_url="https://cdn/u", codecs_map={str(video): H264_AAC})
+    f = _file(video)
+    with pytest.raises(SourceError) as excinfo:
+        await provider.resolve(_query(f, selected_key="f999"))
+    assert excinfo.value.reason == FailureReason.NO_USABLE_METADATA
+    # subtitle 对非法 key 同样拒绝 (返回 None, 不回落第一条)
+    assert await provider.subtitle(_query(f, selected_key="f999"), "s0") is None
 
 
 @pytest.mark.asyncio

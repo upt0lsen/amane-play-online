@@ -1,5 +1,10 @@
 """网盘挂载播放源.
 
+.. 版权说明:
+   本文件衍生自社区样本 nas.local 的 plugin.py v1.0.28 (GPL-3.0),
+   原始版权归原样本作者所有, 2026-11-20 起修改, 修改记录见仓库 git 历史.
+   按 GPL-3.0 第 5 条发布, 完整声明见仓库 NOTICE 文件.
+
 输入与样本 ``nas.local`` 一致: 条目已索引的**本地路径** (docker 挂载点). 片子物理上在
 115 / 夸克等网盘, 由 AList / WebDAV 挂在容器内, 本插件在播放时把本地路径解析回**网盘直链**:
 
@@ -337,18 +342,6 @@ QSV_PRESETS = {
     "medium": "medium",
 }
 
-#: 找不到 ffmpeg 时内置的默认下载源: gh-proxy.com 是国内可达的 GitHub 发布包代理,
-#: 2026-11 实测 HEAD 200、可完整下载 (约 88KB/s, 140MB 包需 20 分钟左右, 仅首装触发一次).
-FFMPEG_DEFAULT_URL = (
-    "https://gh-proxy.com/https://github.com/BtbN/FFmpeg-Builds/releases/download/"
-    "latest/ffmpeg-master-latest-linux64-gpl.tar.xz"
-)
-#: 备份下载源 (顺序尝试).
-FFMPEG_FALLBACK_URLS = (
-    "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz",
-    "https://ghproxy.net/https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz",
-)
-
 #: 播放清晰度档位: (目标高度, 展示名). 0 表示原画. 直通文件只有原画一档.
 QUALITY_LEVELS: tuple[tuple[int, str], ...] = (
     (0, "原画"),
@@ -443,8 +436,18 @@ class PluginSettings(BaseModel):
     )
     ffmpeg_download_url: str = Field(
         default="",
-        title="ffmpeg 下载地址 (留空用内置国内镜像)",
-        description="找不到 ffmpeg 时自动从此地址下载静态版 ffmpeg 压缩包并部署; 留空使用内置国内高速镜像 (gh-proxy.com 代理 GitHub 发布包)",
+        title="ffmpeg 下载地址 (固定版本)",
+        description="自动下载启用时从此地址下载静态版 ffmpeg 压缩包; 必须用固定版本链接 (不要用 latest), 与下一项哈希配套",
+    )
+    allow_ffmpeg_download: bool = Field(
+        default=False,
+        title="允许自动下载 ffmpeg",
+        description="默认关闭. 开启后仍需同时配置固定版本下载地址与 SHA-256 哈希, 下载校验通过才会执行; 推荐优先用「ffmpeg 压缩包路径」本机部署",
+    )
+    ffmpeg_download_sha256: str = Field(
+        default="",
+        title="ffmpeg 压缩包 SHA-256",
+        description="64 位十六进制; 下载完成后校验哈希, 不一致立即删除并拒绝执行. 留空则拒绝下载",
     )
     encoder: Encoder = Field(
         default="auto",
@@ -917,17 +920,31 @@ def _unpack_bundle(bundle: Path, dest_dir: Path) -> Path | None:
     return target
 
 
-def _fetch_bundle(url: str, dest_dir: Path) -> Path | None:
-    """下载压缩包 (流式写盘, 不占内存) 并返回路径; 失败返回 None."""
-    import urllib.request
+def _fetch_bundle(url: str, dest_dir: Path, sha256: str) -> Path | None:
+    """下载压缩包 (流式写盘 + SHA-256 校验, 不占内存); 校验失败返回 None.
+
+    哈希不一致立即删除落盘文件并拒绝执行 —— 不在完整性无保障的情况下跑下载来的二进制.
+    """
+    import hashlib as _hashlib
 
     dest_dir.mkdir(parents=True, exist_ok=True)
     local = dest_dir / f"ffmpeg-bundle-{int(time.time())}.tmp"
+    digest = _hashlib.sha256()
     request = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 amane-plugin"})
     try:
-        with urllib.request.urlopen(request, timeout=120) as response, open(local, "wb") as out:
-            shutil.copyfileobj(response, out, length=1 << 20)
+        with urllib.request.urlopen(request, timeout=300) as response, open(local, "wb") as out:
+            while True:
+                chunk = response.read(1 << 20)
+                if not chunk:
+                    break
+                digest.update(chunk)
+                out.write(chunk)
     except (OSError, ValueError, urllib.error.URLError, TimeoutError):  # type: ignore[attr-defined]
+        with contextlib.suppress(OSError):
+            local.unlink()
+        return None
+    if digest.hexdigest() != sha256:
+        logger.warning("ffmpeg 压缩包 SHA-256 校验失败, 已删除, 拒绝执行")
         with contextlib.suppress(OSError):
             local.unlink()
         return None
@@ -943,20 +960,30 @@ def _deploy_ffmpeg(settings: PluginSettings, data_dir: Path) -> Path | None:
         deployed = _unpack_bundle(bundle, data_dir)
         if deployed is not None and _runs(deployed):
             return deployed
-    urls = [settings.ffmpeg_download_url.strip().strip('"'), FFMPEG_DEFAULT_URL, *FFMPEG_FALLBACK_URLS]
-    tried: set[str] = set()
-    for url in urls:
-        if not url or url in tried:
-            continue
-        tried.add(url)
-        bundle = _fetch_bundle(url, data_dir / "downloads")
-        if bundle is None:
-            continue
-        deployed = _unpack_bundle(bundle, data_dir)
-        with contextlib.suppress(OSError):
-            bundle.unlink()
-        if deployed is not None and _runs(deployed):
-            return deployed
+    # 自动下载默认关闭, 需显式 opt-in (萱儿复核项 6): 且必须同时配置固定版本地址
+    # 与 SHA-256 哈希, 下载校验通过才会执行. 内置镜像源已移除 (移动版本不可固定哈希).
+    if not settings.allow_ffmpeg_download:
+        logger.warning(
+            "未找到 ffmpeg, 且自动下载未启用 (allow_ffmpeg_download=False);"
+            " 请配置 ffmpeg_path / ffmpeg_bundle_path, 或显式开启自动下载并提供哈希"
+        )
+        return None
+    url = settings.ffmpeg_download_url.strip().strip('"')
+    sha256 = settings.ffmpeg_download_sha256.strip().lower()
+    if not url or not sha256:
+        logger.warning("自动下载需同时配置固定版本 ffmpeg_download_url 与 ffmpeg_download_sha256")
+        return None
+    if not re.fullmatch(r"[0-9a-f]{64}", sha256):
+        logger.warning("ffmpeg_download_sha256 不是 64 位小写十六进制, 拒绝下载")
+        return None
+    bundle = _fetch_bundle(url, data_dir / "downloads", sha256)
+    if bundle is None:
+        return None
+    deployed = _unpack_bundle(bundle, data_dir)
+    with contextlib.suppress(OSError):
+        bundle.unlink()
+    if deployed is not None and _runs(deployed):
+        return deployed
     return None
 
 
@@ -1087,6 +1114,46 @@ def total_segments(duration: float, seconds: float) -> int:
 
 RESOLVE_TIMEOUT_SECONDS = 10.0
 
+#: 跟随上游重定向的上限 (次). 超过即视为不可用, 调用方回退本机路径.
+MAX_REDIRECT_HOPS = 5
+_REDIRECT_CODES = frozenset({301, 302, 303, 307, 308})
+#: 跨源重定向时必须剥离的敏感请求头 (防凭据泄露给第三方 origin).
+_SENSITIVE_HEADER_NAMES = frozenset({"authorization", "proxy-authorization"})
+#: 终态响应里视为错误页的 Content-Type, 命中即判不可用 (回退本机).
+_BAD_CONTENT_TYPES = frozenset({"text/html", "application/json", "text/plain"})
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """拦截 3xx, 由我们自己逐跳处理 (以便做同源凭据策略)."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ANN001, ANN202
+        return None
+
+
+_OPENER = urllib.request.build_opener(_NoRedirect)
+
+
+def _origin_of(url: str) -> str | None:
+    """``scheme://host:port`` 形式的源; 非绝对 http(s) URL 返回 ``None``."""
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        return None
+    default = 443 if parsed.scheme == "https" else 80
+    try:
+        port = parsed.port or default
+    except ValueError:
+        return None
+    return f"{parsed.scheme}://{parsed.hostname}:{port}"
+
+
+def _has_dot_segments(path: Path) -> bool:
+    """路径里含 ``.`` / ``..`` 段: 可能越出挂载点, 一律拒绝解析 (回退本机)."""
+    return any(part in (".", "..") for part in path.parts)
+
+
+def _strip_sensitive(headers: dict[str, str]) -> dict[str, str]:
+    return {key: value for key, value in headers.items() if key.casefold() not in _SENSITIVE_HEADER_NAMES}
+
 
 @dataclass(frozen=True, slots=True)
 class MountTarget:
@@ -1097,7 +1164,9 @@ class MountTarget:
 
 
 def _match_mount(settings: PluginSettings, path: Path) -> MountConfig | None:
-    """按最长前缀在 ``mounts`` 里找挂载配置; 找不到返回 ``None`` (按本机文件处理)."""
+    """按最长前缀在 ``mounts`` 里找挂载配置; 找不到 / 路径含 dot-segment 返回 ``None``."""
+    if _has_dot_segments(path):
+        return None
     raw = str(path)
     best: MountConfig | None = None
     best_len = -1
@@ -1124,9 +1193,11 @@ def _alist_dlink(mount: MountConfig, remote: str) -> str | None:
     """AList ``POST /api/fs/get`` 现签 ``dlink`` 直链. 不带缓存: sign 有时效, 每次现签.
 
     AList 的 ``raw_url`` 是已签名的下载直链; ``url`` 是带 sign 参数的代理地址, 作兜底.
+    返回的 URL 必须是绝对 http(s), 否则返回 ``None`` (防 alist 被篡改后把
+    file:/// concat: 这类 URL 喂给 ffmpeg).
     """
     address = mount.address.rstrip("/")
-    if not address:
+    if _origin_of(address) is None:
         return None
     body = json.dumps({"path": remote}).encode("utf-8")
     request = urllib.request.Request(
@@ -1149,13 +1220,20 @@ def _alist_dlink(mount: MountConfig, remote: str) -> str | None:
     if not isinstance(data, dict):
         return None
     url = data.get("raw_url") or data.get("url")
-    return str(url) if url else None
+    if not url:
+        return None
+    url = str(url)
+    return url if _origin_of(url) is not None else None
 
 
 def _webdav_target(mount: MountConfig, remote: str) -> MountTarget | None:
-    """WebDAV: 地址 + 转义后的远端路径; 有用户名就做 Basic 认证."""
+    """WebDAV: 地址 + 转义后的远端路径; 有用户名就做 Basic 认证.
+
+    地址本身必须是绝对 http(s); Basic 凭据随后续重定向的源策略处理 (见
+    :func:`_verify_target`), 不全局无脑跟随.
+    """
     address = mount.address.rstrip("/")
-    if not address:
+    if _origin_of(address) is None:
         return None
     quoted = "/".join(urllib.parse.quote(part) for part in remote.split("/"))
     url = f"{address}/{quoted.lstrip('/')}"
@@ -1167,13 +1245,68 @@ def _webdav_target(mount: MountConfig, remote: str) -> MountTarget | None:
 
 
 def resolve_mount(mount: MountConfig, path: Path) -> MountTarget | None:
-    """把一个本地路径解析成上游目标; 解析不了返回 ``None`` (调用方回退本机路径)."""
+    """把一个本地路径解析成上游目标; 解析不了 / 路径非法返回 ``None`` (调用方回退本机)."""
+    if _has_dot_segments(path):
+        return None
     remote = _remote_path(mount, path)
     if mount.backend == "alist":
         url = _alist_dlink(mount, remote)
         return MountTarget(url=url, headers={}) if url else None
     if mount.backend == "webdav":
         return _webdav_target(mount, remote)
+    return None
+
+
+def _verify_target(target: MountTarget) -> MountTarget | None:
+    """预检上游: 跟随重定向直到 2xx, 确认可达且是媒体流, 否则 ``None``.
+
+    背景 (萱儿复核项 1): amane v0.28.0 的播放代理 ``follow_redirects=False``, 上游 3xx
+    一律 502, 所以 3xx 必须由插件侧先消化掉, 把最终 200/206 的地址交给主机. 同时这里也是
+    失败回退本机的判定点: 预检不过, 调用方直接读本机路径.
+
+    凭据策略 (萱儿复核项 3): **同源才带敏感头**. 任何一跳换 origin
+    (``scheme://host:port`` 变化), 立即剥离 ``Authorization`` 等敏感头再继续 —
+    不把 Basic/Bearer 凭据转发给第三方域. 用户Agent 等无害头保留.
+    终点必须是绝对 http(s) 且状态 200/206; 错误页 Content-Type (text/html 等) 判不可用.
+    """
+    url = target.url
+    headers = dict(target.headers)
+    if _origin_of(url) is None:
+        return None
+    for _ in range(MAX_REDIRECT_HOPS + 1):
+        origin = _origin_of(url)
+        if origin is None:
+            return None
+        request = urllib.request.Request(
+            url,
+            headers={"User-Agent": "Mozilla/5.0 amane-plugin", "Range": "bytes=0-0", **headers},
+        )
+        try:
+            response = _OPENER.open(request, timeout=RESOLVE_TIMEOUT_SECONDS)
+        except urllib.error.HTTPError as exc:
+            if exc.code in _REDIRECT_CODES:
+                location = exc.headers.get("Location") if exc.headers else None
+                if not location:
+                    return None
+                new_url = urllib.parse.urljoin(url, location)
+                if _origin_of(new_url) != origin:
+                    headers = _strip_sensitive(headers)
+                url = new_url
+                continue
+            return None
+        except (OSError, ValueError, TimeoutError, urllib.error.URLError):
+            return None
+        with contextlib.closing(response):
+            code = response.getcode()
+            final_url = response.geturl()
+            if not (200 <= code < 300):
+                return None
+            if _origin_of(final_url) is None:
+                return None
+            content_type = (response.headers.get("Content-Type") or "").split(";")[0].strip().casefold()
+            if content_type in _BAD_CONTENT_TYPES:
+                return None
+            return MountTarget(url=final_url, headers=headers)
     return None
 def _mp4_boxes(data: bytes, start: int, end: int):
     pos = start
@@ -3376,6 +3509,17 @@ class OnlineProvider(PlaybackProvider):
             return None
         return await asyncio.to_thread(resolve_mount, mount, path)
 
+    async def _verified_target(self, path: Path) -> MountTarget | None:
+        """解析直链并预检可达性 (插件侧消化 3xx, 同源才带凭据).
+
+        预检不过返回 ``None``: 调用方回退本机路径, 不把 3xx/不可达地址甩给
+        主机反代 (amane v0.28.0 代理对上游 3xx 一律 502).
+        """
+        target = await self._mount_target(path)
+        if target is None:
+            return None
+        return await asyncio.to_thread(_verify_target, target)
+
     # -- 探测 -----------------------------------------------------------
 
     async def _codecs(self, path: Path, tools: Tools | None) -> MediaCodecs | None:
@@ -3462,8 +3606,16 @@ class OnlineProvider(PlaybackProvider):
     async def resolve(self, query: PlaybackQuery):
         """返回选中那条流对应的播放目标; 没指定时挑第一条能播的."""
         tools = await self._resolve_tools()
-        selected = _file_by_key(query, query.selected_key)
-        if selected is None:
+        if query.selected_key:
+            selected = _file_by_key(query, query.selected_key)
+            if selected is None:
+                # SDK 契约: 认不出的 key 插件必须拒绝, 不能改播别的文件 (萱儿复核项 2).
+                raise SourceError(
+                    FailureReason.NO_USABLE_METADATA,
+                    detail=f"选中的流不存在: {query.selected_key}",
+                )
+        else:
+            selected = None
             for item in query.files:
                 path = Path(item.path)
                 plan = await self._plan(path, tools)
@@ -3481,10 +3633,10 @@ class OnlineProvider(PlaybackProvider):
         return await self._transcode_target(path, tools)
 
     async def _direct_target(self, path: Path, plan: Plan):
-        """直连通路: 挂载允许直链时解析网盘直链跳上游; 否则 / 解析失败回退主机 FilePlaybackTarget."""
+        """直连通路: 挂载允许直链时解析并预检网盘直链跳上游; 否则 / 预检失败回退主机 FilePlaybackTarget."""
         mount = self._mount_for(path)
         if mount is not None and mount.allow_direct:
-            target = await self._mount_target(path)
+            target = await self._verified_target(path)
             if target is not None:
                 # 直链 sign 有时效: 不声明 cache_ttl, 每次取流都重新解析现签现跳.
                 return UpstreamPlaybackTarget(url=target.url, headers=target.headers, content_type=plan.content_type)
@@ -3504,7 +3656,8 @@ class OnlineProvider(PlaybackProvider):
         headers: dict[str, str] = {}
         mount = self._mount_for(path)
         if mount is not None and mount.allow_direct and mount.prefer_url_transcode:
-            target = await self._mount_target(path)
+            # 预检: 3xx 在插件侧消化, 同源才带凭据; 预检不过回退本机路径.
+            target = await self._verified_target(path)
             if target is not None:
                 source_input = target.url
                 headers = target.headers
@@ -3535,10 +3688,14 @@ class OnlineProvider(PlaybackProvider):
         return self._cache_root
 
     async def subtitle(self, query: PlaybackQuery, track_id: str) -> str | None:
-        selected = _file_by_key(query, query.selected_key)
-        if selected is None and query.files:
+        if query.selected_key:
+            selected = _file_by_key(query, query.selected_key)
+            if selected is None:
+                # 非法 key 同样拒绝, 不回落到第一条 (与 resolve 契约一致).
+                return None
+        elif query.files:
             selected = query.files[0]
-        if selected is None:
+        else:
             return None
         video = Path(selected.path)
         for index, (path, suffix) in enumerate(_scan_subtitles(video)):
