@@ -1122,7 +1122,7 @@ _SENSITIVE_HEADER_NAMES = frozenset({"authorization", "proxy-authorization"})
 #: 终态响应里视为错误页的 Content-Type; 预检改为**媒体类型白名单** (萱儿复审 B2):
 #: 只放行 video/* / audio/* / application/octet-stream, 其余 (image/*、+json、text/*)
 #: 一律判不可用, 调用方回退本机路径.
-_MEDIA_CONTENT_PREFIXES = ("video/", "audio/")
+_MEDIA_MAIN_TYPES = frozenset({"video", "audio"})
 _MEDIA_CONTENT_EXACT = frozenset({"application/octet-stream"})
 #: 预检放行的状态码严格限定 200/206 (萱儿复审 B1: 204 No Content 等一律拒绝).
 _OK_CODES = frozenset({200, 206})
@@ -1165,10 +1165,21 @@ def _has_sensitive_headers(headers: dict[str, str]) -> bool:
 
 
 def _is_media_content_type(content_type: str) -> bool:
-    """媒体类型白名单; 空 Content-Type 放行 (部分服务器不返回, 由状态码兜底)."""
-    if not content_type:
+    """媒体类型白名单, fail-closed: 缺失 / 空白 / 畸形一律拒绝并回退本机.
+
+    只接受 ``video/<非空子类型>``、``audio/<非空子类型>`` 与 ``application/octet-stream``;
+    空 Content-Type、``video/`` / ``audio/`` 空子类型、其他类型全部拒绝。
+    本机回退已能保播放, 不为直链优化而 fail-open。
+    """
+    if not content_type or not content_type.strip():
+        return False
+    media_type = content_type.split(";", 1)[0].strip().casefold()
+    if not media_type:
+        return False
+    if media_type in _MEDIA_CONTENT_EXACT:
         return True
-    return content_type.startswith(_MEDIA_CONTENT_PREFIXES) or content_type in _MEDIA_CONTENT_EXACT
+    main_type, _, subtype = media_type.partition("/")
+    return main_type in _MEDIA_MAIN_TYPES and bool(subtype)
 
 
 @dataclass(frozen=True, slots=True)

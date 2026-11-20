@@ -384,6 +384,56 @@ def test_verify_rejects_204() -> None:
         httpd.server_close()
 
 
+def test_probe_rejects_missing_content_type_with_error_page():
+    """无 Content-Type 的 200/206 + HTML 错误页: fail-closed 拒绝并回退 FilePlaybackTarget (萱儿三审 B2)."""
+    body = b"<!doctype html><title>Error</title><h1>Something went wrong</h1>"
+
+    def _handler(request: BaseHTTPRequestHandler) -> None:
+        request.send_response_only(200)
+        request.send_header("Content-Length", str(len(body)))
+        request.end_headers()
+        request.wfile.write(body)
+
+    with _serve(_handler) as port:
+        target = _resolve_port(port)
+        assert target is not None
+        assert isinstance(target, FilePlaybackTarget)  # 回退本机, 不接受无类型直链
+        assert target.path == "/media/movies/demo.mkv"
+
+
+def test_probe_rejects_partial_without_content_type():
+    """206 无 Content-Type 同样拒绝 (Range 预检路径同样 fail-closed)."""
+
+    def _handler(request: BaseHTTPRequestHandler) -> None:
+        request.send_response_only(206)
+        request.send_header("Content-Range", "bytes 0-0/1048576")
+        request.send_header("Content-Length", "1")
+        request.end_headers()
+        request.wfile.write(b"x")
+
+    with _serve(_handler) as port:
+        target = _resolve_port(port)
+        assert target is not None
+        assert isinstance(target, FilePlaybackTarget)
+
+
+@pytest.mark.parametrize("content_type", ["video/", "audio/", "video/; charset=binary", "VIDEO/", "  audio/  "])
+def test_probe_rejects_empty_media_subtype(content_type: str) -> None:
+    """video/、audio/ 空子类型 (含参数、大小写、空白变体): 拒绝并回退 FilePlaybackTarget."""
+
+    def _handler(request: BaseHTTPRequestHandler) -> None:
+        request.send_response_only(200)
+        request.send_header("Content-Type", content_type)
+        request.send_header("Content-Length", "2")
+        request.end_headers()
+        request.wfile.write(b"ok")
+
+    with _serve(_handler) as port:
+        target = _resolve_port(port)
+        assert target is not None
+        assert isinstance(target, FilePlaybackTarget)
+
+
 @pytest.mark.parametrize(
     "content_type",
     ["image/png", "application/problem+json", "text/html", "application/json"],
