@@ -384,54 +384,74 @@ def test_verify_rejects_204() -> None:
         httpd.server_close()
 
 
-def test_probe_rejects_missing_content_type_with_error_page():
-    """无 Content-Type 的 200/206 + HTML 错误页: fail-closed 拒绝并回退 FilePlaybackTarget (萱儿三审 B2)."""
-    body = b"<!doctype html><title>Error</title><h1>Something went wrong</h1>"
+class _NoContentTypeHandler(BaseHTTPRequestHandler):
+    """可编程响应, 可显式省略 Content-Type (萱儿三审 B2 fail-closed 回归用)."""
 
-    def _handler(request: BaseHTTPRequestHandler) -> None:
-        request.send_response_only(200)
-        request.send_header("Content-Length", str(len(body)))
-        request.end_headers()
-        request.wfile.write(body)
+    routes: dict = {}
 
-    with _serve(_handler) as port:
-        target = _resolve_port(port)
-        assert target is not None
-        assert isinstance(target, FilePlaybackTarget)  # 回退本机, 不接受无类型直链
-        assert target.path == "/media/movies/demo.mkv"
+    def do_GET(self) -> None:  # noqa: N802
+        spec = type(self).routes.get(self.path)
+        if spec is None:
+            self.send_error(404)
+            return
+        self.send_response(spec.get("status", 200))
+        if "content_range" in spec:
+            self.send_header("Content-Range", spec["content_range"])
+        if spec.get("content_type") is not None:
+            self.send_header("Content-Type", spec["content_type"])
+        body = spec.get("body", b"ok")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args) -> None:
+        pass
 
 
-def test_probe_rejects_partial_without_content_type():
-    """206 无 Content-Type 同样拒绝 (Range 预检路径同样 fail-closed)."""
+def test_verify_rejects_missing_content_type_error_page() -> None:
+    """无 Content-Type 的 200 + HTML 错误页: fail-closed 拒绝并回退本机 (萱儿三审 B2)."""
 
-    def _handler(request: BaseHTTPRequestHandler) -> None:
-        request.send_response_only(206)
-        request.send_header("Content-Range", "bytes 0-0/1048576")
-        request.send_header("Content-Length", "1")
-        request.end_headers()
-        request.wfile.write(b"x")
+    class H(_NoContentTypeHandler):
+        pass
 
-    with _serve(_handler) as port:
-        target = _resolve_port(port)
-        assert target is not None
-        assert isinstance(target, FilePlaybackTarget)
+    httpd, base = _start_server(H)
+    H.routes = {"/x": {"status": 200, "body": b"<!doctype html><title>Error</title><h1>boom</h1>"}}
+    try:
+        assert _verify_target(MountTarget(url=f"{base}/x", headers={})) is None
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_verify_rejects_partial_without_content_type() -> None:
+    """206 + Content-Range 但无 Content-Type: Range 预检路径同样 fail-closed 拒绝."""
+
+    class H(_NoContentTypeHandler):
+        pass
+
+    httpd, base = _start_server(H)
+    H.routes = {"/x": {"status": 206, "content_range": "bytes 0-0/1048576", "body": b"x"}}
+    try:
+        assert _verify_target(MountTarget(url=f"{base}/x", headers={})) is None
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
 
 
 @pytest.mark.parametrize("content_type", ["video/", "audio/", "video/; charset=binary", "VIDEO/", "  audio/  "])
-def test_probe_rejects_empty_media_subtype(content_type: str) -> None:
-    """video/、audio/ 空子类型 (含参数、大小写、空白变体): 拒绝并回退 FilePlaybackTarget."""
+def test_verify_rejects_empty_media_subtype(content_type: str) -> None:
+    """video/、audio/ 空子类型 (含参数、大小写、空白变体): 拒绝 (萱儿三审 B2)."""
 
-    def _handler(request: BaseHTTPRequestHandler) -> None:
-        request.send_response_only(200)
-        request.send_header("Content-Type", content_type)
-        request.send_header("Content-Length", "2")
-        request.end_headers()
-        request.wfile.write(b"ok")
+    class H(_NoContentTypeHandler):
+        pass
 
-    with _serve(_handler) as port:
-        target = _resolve_port(port)
-        assert target is not None
-        assert isinstance(target, FilePlaybackTarget)
+    httpd, base = _start_server(H)
+    H.routes = {"/x": {"status": 200, "content_type": content_type}}
+    try:
+        assert _verify_target(MountTarget(url=f"{base}/x", headers={})) is None
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
 
 
 @pytest.mark.parametrize(

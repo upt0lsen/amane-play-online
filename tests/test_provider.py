@@ -66,7 +66,9 @@ class _MediaHandler(BaseHTTPRequestHandler):
             return
         body = b"x"
         self.send_response(spec.get("status", 206))
-        self.send_header("Content-Type", spec.get("content_type", "video/mp4"))
+        content_type = spec.get("content_type", "video/mp4")
+        if content_type is not None:
+            self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -206,6 +208,18 @@ async def test_resolve_direct_rejects_non_media_content_type(tmp_path, media_ser
     provider = _make_provider(tmp_path, mount_url=f"{base}/img.mp4", codecs_map={str(video): H264_AAC})
     target = await provider.resolve(_query(_file(video)))
     assert isinstance(target, FilePlaybackTarget)
+
+
+@pytest.mark.asyncio
+async def test_resolve_direct_falls_back_when_no_content_type(tmp_path, media_server) -> None:
+    """预检 200 但无 Content-Type (fail-closed): 回退 FilePlaybackTarget (萱儿三审 B2)."""
+    handler, base = media_server
+    handler.routes = {"/notype.mp4": {"status": 200, "content_type": None}}
+    video = tmp_path / "a.mp4"
+    provider = _make_provider(tmp_path, mount_url=f"{base}/notype.mp4", codecs_map={str(video): H264_AAC})
+    target = await provider.resolve(_query(_file(video)))
+    assert isinstance(target, FilePlaybackTarget)
+    assert target.path == video
 
 
 @pytest.mark.asyncio
