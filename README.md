@@ -1,18 +1,32 @@
 # amane-play-online
 
-[Amane](https://github.com/sqzw-x/amane) 在线媒体播放源插件：**302 直连 + 转码双通路**。
+[Amane](https://github.com/sqzw-x/amane) 网盘挂载播放源插件：**直链直连 + 转码双通路**。
 
-- **直连通路**：浏览器可解码的在线源（mp4 / m4v / mov / webm / ogv，视频 h264 / vp8 / vp9 /
-  av1，音频 aac / opus / mp3 …）原样返回 `UpstreamPlaybackTarget` 跳上游，不转码、画质无损、
-  任意跳转。
-- **转码通路**：其余来源由本插件调用 ffmpeg 从 URL 拉流，实时转成 fMP4 HLS（完整 VOD 清单，
-  `-ss` 拖动重起转，分片缓存空闲回收，NVENC / QSV 硬件编码自动探测回退，AAC 重编码对齐分片
-  边界，srt / ass / vtt 字幕自动转 WebVTT），分片经回环 HTTP 由 Amane 反代给播放器。
+输入与社区样本 `nas.local` 一致——条目已索引的**本地路径**（docker 挂载点）。片子物理上在
+115 / 夸克等网盘，由 AList / WebDAV 挂载进容器，本插件在播放时把本地路径解析回**网盘直链**：
 
-媒体 URL 完全由**可配置 resolver**（插件设置项 `resolver_url`）按条目番号解析返回，插件不
-内置任何上游。架构参照社区样本插件 `nas.local`（本机文件播放源，GPL-3.0）；样本的「原画
-直出」通路依赖本机 mp4 关键帧表，对在线源不适用，未实现——浏览器可解码的在线源由直连通路
-覆盖。
+- **直连通路**：容器与编码浏览器都能解码时（mp4 / m4v / mov / webm / ogv，视频 h264 / vp8 /
+  vp9 / av1，音频 aac / opus / mp3 …），经挂载映射解析成网盘直链，返回
+  `UpstreamPlaybackTarget` 跳上游，不转码、画质不变、任意跳转。
+- **转码通路**：其余文件由本插件调用 ffmpeg 实时转成 fMP4 HLS（完整 VOD 清单、`-ss` 拖动
+  重起转、分片缓存空闲回收、NVENC / QSV 硬件编码自动探测回退、AAC 重编码对齐分片边界）。
+  ffmpeg **优先从网盘直链 URL 拉流**（避免走 FUSE 双重中转），resolver 失败时回退读本机
+  挂载路径。
+- 同目录同名 `.srt` / `.vtt` / `.ass` 字幕自动列轨并转 WebVTT（与样本一致）。
+
+路径 → 后端的映射由插件设置项 `mounts` 决定（**最长前缀匹配**，多组）：
+
+| 本地前缀 | 后端 | 说明 |
+|---|---|---|
+| `/mnt/115` | `alist: http://alist:5244` | AList 挂载的 115 网盘，`POST /api/fs/get` 现签直链 |
+| `/mnt/quark` | `alist: http://alist:5244` | 同一 AList 的另一个挂载点 |
+| `/mnt/dav` | `webdav: https://dav.xxx/dav` | WebDAV 直接拼 HTTP 地址 |
+
+AList 直链带时效 sign，**不缓存，每次播放请求现解析现跳**；WebDAV 支持 Basic 认证。每个挂载
+可单独关闭直链（`allow_direct=False`），该挂载一律读本机路径。
+
+架构参照社区样本 `nas.local`（本机文件播放源，GPL-3.0）；样本的「原画直出」通路依赖本机
+mp4 关键帧表，本插件不实现——浏览器可解码文件由**直连通路**覆盖。
 
 ## 安装
 
@@ -27,12 +41,26 @@ upt0lsen.play-online/
 
 ## 配置
 
+### mounts（挂载映射，核心配置）
+
+每组映射字段：
+
+| 字段 | 默认 | 说明 |
+|---|---|---|
+| `local_prefix` | —（必填） | docker 内挂载路径前缀，如 `/mnt/115`；最长前缀匹配 |
+| `backend` | `alist` | `alist` / `webdav` |
+| `address` | （空） | alist: `http://alist:5244`；webdav: `https://dav.xxx/dav`（到挂载根为止） |
+| `remote_prefix` | `/` | 后端内该挂载对应的起始路径，如 `/115` |
+| `token` | （空） | alist: AList 令牌；webdav: 密码。**只填运行配置，绝不入库** |
+| `username` | （空） | 仅 webdav 使用 |
+| `allow_direct` | `true` | 关闭后该挂载一律读本机路径（不走直链） |
+| `prefer_url_transcode` | `true` | 转码时 ffmpeg 优先读 http 直链，解析失败自动回退本地 |
+
+### 转码与直连（全局）
+
 | 配置项 | 默认 | 说明 |
 |---|---|---|
-| `resolver_url` | （空） | **必填**。GET 地址，用 `{number}` 占位条目番号。返回 JSON（见下）或纯文本媒体 URL |
-| `resolver_token` | （空） | 非空时作为 `Authorization: Bearer <令牌>` 发给解析接口。令牌只填在运行配置里，**不要写进任何入库文件** |
-| `resolver_timeout` | 10 | 解析接口超时（秒） |
-| `direct_play` | true | 允许浏览器可解码的源直连播放；关闭则一律转码 |
+| `direct_play` | `true` | 允许浏览器可解码的文件直连播放；关闭则一律转码 |
 | `ffmpeg_path` | （空） | 留空自动在 PATH / 插件数据目录 / Jellyfin / 常见位置查找 |
 | `ffmpeg_bundle_path` | （空） | 本机 ffmpeg 压缩包路径，找不到时自动解压部署 |
 | `ffmpeg_download_url` | （空） | 留空用内置国内镜像自动下载 |
@@ -43,33 +71,15 @@ upt0lsen.play-online/
 | `max_height` | 0 | 0 保持原分辨率 |
 | `idle_timeout` | 900 | 缓存保留（秒），超时删分片 |
 
-### resolver 接口约定
+### resolver 行为说明
 
-`GET {resolver_url}`（`{number}` 已替换为番号，URL 编码）。响应两种形式：
-
-**JSON（推荐）**，单流或多流，流可带独立 `headers`（合并到解析请求头之上，用于给具体
-上游带鉴权）与 `subtitles`：
-
-```json
-{
-  "streams": [
-    {
-      "url": "https://cdn.example.com/ABC-123.mp4",
-      "name": "MP4 直连",
-      "headers": {"X-Upstream-Token": "..."},
-      "subtitles": [
-        {"url": "https://cdn.example.com/ABC-123.srt", "label": "中字", "language": "chi"}
-      ]
-    },
-    {"url": "https://cdn.example.com/ABC-123.mkv", "name": "蓝光"}
-  ]
-}
-```
-
-**纯文本**：整段响应体就是一个媒体 URL。
-
-解析结果按番号缓存 600 秒。字幕轨 id 若含路径非法字符会被替换为兜底值；后缀按 URL 猜测
-（srt / vtt / ass / ssa），认不出按 srt 处理。
+- **alist**：`POST {address}/api/fs/get`，body `{"path": "{remote_prefix下的路径"}`，取
+  `data.raw_url`（签名直链），`data.url` 兜底。响应非 200 或网络失败 → 回退本机路径。
+- **webdav**：`{address}/{逐段转义的远端路径}`，有用户名/密码时加 Basic 认证头。
+- **直链 sign 时效**：不缓存解析结果，每次播放请求现签现跳；`UpstreamPlaybackTarget`
+  不声明 `cache_ttl`。
+- **302 说明**：amane SDK 的 `UpstreamPlaybackTarget` 是主机反代转发，不是浏览器直连的
+  真 302；115/夸克 `/d/` 链接浏览器直访可行性**待实测**（见 PR 待确认问题）。
 
 ## 测试
 
@@ -78,9 +88,9 @@ python -m venv .venv && .venv/bin/pip install pydantic pytest
 .venv/bin/python -m pytest tests/ -v
 ```
 
-39 个用例：设置校验 / resolver 解析 / 字幕转换 / 清单生成 / 双通路判定（打桩，不触网），
-外加真实 ffmpeg 端到端（本机起 Range 静态服务 → URL 探测 → 起转 → VOD 清单 → 拖动末段
-`-ss` 重起转），需要本机装有 ffmpeg，未装自动跳过。
+42 个用例：设置/挂载映射校验、alist 现签（本机假 HTTP 服务验证请求路径与鉴权头）、WebDAV
+地址拼接、双通路判定、字幕转换、清单生成，外加真实 ffmpeg 端到端（HTTP 直链拉流转 HLS +
+本机路径回退转 HLS，拖动末段 `-ss` 重起转），需要本机装有 ffmpeg，未装自动跳过。
 
 ## 回滚
 

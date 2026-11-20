@@ -78,6 +78,17 @@ class SubtitleTrack(BaseModel):
     language: str | None = None
 
 
+class PlaybackMediaFile(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: int
+    path: str
+    size: int | None = None
+    content_type: str | None = None
+    has_subtitle: bool = False
+    library_id: int = 0
+
+
 class PlaybackOffer(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -87,6 +98,15 @@ class PlaybackOffer(BaseModel):
     seekable: bool = True
     unavailable: str | None = Field(default=None, min_length=1)
     subtitles: tuple[SubtitleTrack, ...] = ()
+
+
+class FilePlaybackTarget(BaseModel):
+    model_config = ConfigDict(extra="forbid", arbitrary_types_allowed=True)
+
+    kind: Literal["file"] = "file"
+    path: Path
+    content_type: str
+    cache_ttl: float | None = Field(default=None, gt=0)
 
 
 class PlaybackQuery(BaseModel):
@@ -174,6 +194,8 @@ def _install_stub() -> None:
         "SourceCapability": SourceCapability,
         "SourceDescriptor": SourceDescriptor,
         "SubtitleTrack": SubtitleTrack,
+        "PlaybackMediaFile": PlaybackMediaFile,
+        "FilePlaybackTarget": FilePlaybackTarget,
         "PlaybackOffer": PlaybackOffer,
         "PlaybackQuery": PlaybackQuery,
         "UpstreamPlaybackTarget": UpstreamPlaybackTarget,
@@ -186,6 +208,7 @@ def _install_stub() -> None:
     }.items():
         setattr(plugin, name, value)
     amane.plugin = plugin
+    amane.__path__ = []  # 标记为包, 让 from amane.plugin import ... 走子模块导入
     sys.modules.setdefault("amane", amane)
     sys.modules.setdefault("amane.plugin", plugin)
 

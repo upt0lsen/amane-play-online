@@ -1,78 +1,157 @@
-"""resolver 响应解析测试."""
+"""挂载解析器测试: 前缀匹配 / alist 现签 / WebDAV 拼地址 / 回退语义."""
 
 from __future__ import annotations
 
-from plugin import _parse_resolver_payload
+import json
+import threading
+from http.server import BaseHTTPRequestHandler
+from pathlib import Path
 
-BASE_HEADERS = {"Authorization": "Bearer t"}
+import pytest
 
-
-def test_plain_text_single_url() -> None:
-    streams = _parse_resolver_payload("https://cdn.example.com/a.mp4", BASE_HEADERS)
-    assert len(streams) == 1
-    assert streams[0].url == "https://cdn.example.com/a.mp4"
-    assert streams[0].headers == BASE_HEADERS
-    assert streams[0].subtitles == ()
-
-
-def test_json_single_stream() -> None:
-    text = '{"url": "https://cdn.example.com/a.mkv", "name": "蓝光"}'
-    streams = _parse_resolver_payload(text, BASE_HEADERS)
-    assert len(streams) == 1
-    assert streams[0].name == "蓝光"
+from plugin import (
+    MountConfig,
+    PluginSettings,
+    _match_mount,
+    _remote_path,
+    _webdav_target,
+    resolve_mount,
+)
 
 
-def test_json_multi_streams_with_headers_and_subtitles() -> None:
-    text = (
-        '{"streams": ['
-        '{"url": "https://a/1.mkv", "headers": {"X-Token": "abc"}, '
-        ' "subtitles": [{"url": "https://a/1.srt", "label": "中字", "language": "chi"}]},'
-        '{"url": "https://a/2.mp4"}'
-        ']}'
+def _settings(*mounts: MountConfig) -> PluginSettings:
+    return PluginSettings(mounts=list(mounts))
+
+
+ALIST_115 = MountConfig(
+    local_prefix="/mnt/115",
+    backend="alist",
+    address="http://alist:5244",
+    remote_prefix="/115",
+    token="alist-token",
+)
+ALIST_QUARK = MountConfig(
+    local_prefix="/mnt/quark",
+    backend="alist",
+    address="http://alist:5244",
+    remote_prefix="/quark",
+    token="alist-token",
+)
+DAV = MountConfig(
+    local_prefix="/mnt/dav",
+    backend="webdav",
+    address="https://dav.example.com/dav",
+    remote_prefix="/media",
+    username="uk",
+    token="dav-pass",
+)
+
+
+def test_match_mount_longest_prefix() -> None:
+    settings = _settings(ALIST_115, MountConfig(local_prefix="/mnt/115/sub", backend="alist", address="http://a"))
+    hit = _match_mount(settings, Path("/mnt/115/sub/film/a.mp4"))
+    assert hit is not None and hit.local_prefix == "/mnt/115/sub"
+    hit = _match_mount(settings, Path("/mnt/115/film/b.mp4"))
+    assert hit is not None and hit.local_prefix == "/mnt/115"
+    assert _match_mount(settings, Path("/mnt/other/c.mp4")) is None
+    # 空 mounts 不配
+    assert _match_mount(PluginSettings(), Path("/mnt/115/a.mp4")) is None
+
+
+def test_remote_path_join() -> None:
+    assert _remote_path(ALIST_115, Path("/mnt/115/film/a.mp4")) == "/115/film/a.mp4"
+    assert _remote_path(ALIST_QUARK, Path("/mnt/quark/a.mkv")) == "/quark/a.mkv"
+    assert _remote_path(DAV, Path("/mnt/dav/x y/a.mp4")) == "/media/x y/a.mp4"
+
+
+def test_webdav_target_quoting_and_auth() -> None:
+    target = _webdav_target(DAV, "/media/x y/a.mp4")
+    assert target is not None
+    assert target.url == "https://dav.example.com/dav/media/x%20y/a.mp4"
+    assert target.headers["Authorization"].startswith("Basic ")
+    # 无凭据不带认证头
+    plain = MountConfig(local_prefix="/m", backend="webdav", address="https://d/dav")
+    target = _webdav_target(plain, "/a.mp4")
+    assert target is not None and target.headers == {}
+
+
+class _AlistHandler(BaseHTTPRequestHandler):
+    """模拟 AList /api/fs/get: 记录请求, 返回固定 raw_url."""
+
+    last_request: dict = {}
+
+    def do_POST(self) -> None:  # noqa: N802 - http.server 命名
+        length = int(self.headers.get("Content-Length", "0"))
+        body = json.loads(self.rfile.read(length).decode("utf-8"))
+        type(self).last_request = {
+            "path": body.get("path"),
+            "authorization": self.headers.get("Authorization"),
+        }
+        payload = json.dumps({"code": 200, "data": {"raw_url": "https://cdn.115.com/signed?sign=abc"}}).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def log_message(self, *args) -> None:
+        pass
+
+
+@pytest.fixture()
+def alist_server():
+    import socketserver
+
+    httpd = socketserver.TCPServer(("127.0.0.1", 0), _AlistHandler)
+    httpd.timeout = 5
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    yield f"http://127.0.0.1:{httpd.server_address[1]}"
+    httpd.shutdown()
+    httpd.server_close()
+
+
+def test_alist_dlink_live_sign(alist_server: str) -> None:
+    mount = MountConfig(
+        local_prefix="/mnt/115", backend="alist", address=alist_server,
+        remote_prefix="/115", token="secret-token",
     )
-    streams = _parse_resolver_payload(text, BASE_HEADERS)
-    assert len(streams) == 2
-    # 流级 headers 合并到基础 headers 之上
-    assert streams[0].headers == {"Authorization": "Bearer t", "X-Token": "abc"}
-    assert streams[1].headers == BASE_HEADERS
-    # 字幕轨
-    assert len(streams[0].subtitles) == 1
-    sub = streams[0].subtitles[0]
-    assert sub.label == "中字"
-    assert sub.language == "chi"
-    assert sub.suffix == ".srt"
-    assert streams[1].subtitles == ()
+    target = resolve_mount(mount, Path("/mnt/115/film/a.mp4"))
+    assert target is not None
+    assert target.url == "https://cdn.115.com/signed?sign=abc"
+    assert target.headers == {}
+    # 请求路径与鉴权头正确
+    assert _AlistHandler.last_request["path"] == "/115/film/a.mp4"
+    assert _AlistHandler.last_request["authorization"] == "secret-token"
 
 
-def test_top_level_list() -> None:
-    streams = _parse_resolver_payload('[{"url": "https://a/1.mp4"}]', BASE_HEADERS)
-    assert len(streams) == 1
+def test_alist_failure_falls_back(alist_server: str) -> None:
+    """AList 返回非 200 -> None (调用方回退本机路径)."""
+
+    class _BadHandler(_AlistHandler):
+        def do_POST(self) -> None:  # noqa: N802
+            payload = json.dumps({"code": 500, "message": "fail"}).encode()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+    import socketserver
+
+    httpd = socketserver.TCPServer(("127.0.0.1", 0), _BadHandler)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    try:
+        mount = MountConfig(local_prefix="/m", backend="alist", address=f"http://127.0.0.1:{httpd.server_address[1]}")
+        assert resolve_mount(mount, Path("/m/a.mp4")) is None
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
 
 
-def test_invalid_json_returns_empty() -> None:
-    assert _parse_resolver_payload("{not json", BASE_HEADERS) == ()
+def test_alist_unreachable_returns_none() -> None:
+    mount = MountConfig(local_prefix="/m", backend="alist", address="http://127.0.0.1:1")
+    assert resolve_mount(mount, Path("/m/a.mp4")) is None
 
 
-def test_empty_payload_returns_empty() -> None:
-    assert _parse_resolver_payload("", BASE_HEADERS) == ()
-    assert _parse_resolver_payload("   \n", BASE_HEADERS) == ()
-
-
-def test_stream_without_url_skipped() -> None:
-    text = '{"streams": [{"name": "无地址"}, {"url": "https://a/1.mp4"}]}'
-    streams = _parse_resolver_payload(text, BASE_HEADERS)
-    assert len(streams) == 1
-
-
-def test_subtitle_id_sanitized() -> None:
-    text = (
-        '{"url": "https://a/1.mkv", "subtitles": ['
-        '{"url": "https://a/1.vtt", "id": "bad/id"},'
-        '{"url": "https://a/2.vtt", "id": "zh.01"}'
-        ']}'
-    )
-    streams = _parse_resolver_payload(text, BASE_HEADERS)
-    subs = streams[0].subtitles
-    assert subs[0].id == "s0x0"  # 非法 id 退回兜底值
-    assert subs[1].id == "zh.01"
-    assert subs[0].suffix == ".vtt"
+def test_backend_local_or_unknown_returns_none() -> None:
+    # 未配置挂载: 无匹配即 None
+    assert _match_mount(PluginSettings(), Path("/anywhere/a.mp4")) is None

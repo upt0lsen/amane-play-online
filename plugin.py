@@ -1,30 +1,34 @@
-"""在线媒体播放源.
+"""网盘挂载播放源.
 
-把可配置 resolver 解析出的**在线媒体 URL** 交给主机播放. 架构参照社区样本插件
-``nas.local`` (本机文件播放源, GPL-3.0) 的双通路设计, 输入从本机路径换成了在线 URL:
+输入与样本 ``nas.local`` 一致: 条目已索引的**本地路径** (docker 挂载点). 片子物理上在
+115 / 夸克等网盘, 由 AList / WebDAV 挂在容器内, 本插件在播放时把本地路径解析回**网盘直链**:
 
-- **直连**: 容器与编码浏览器都能解码时 (mp4 / m4v / mov / webm / ogv, 视频 h264 / vp8 /
-  vp9 / av1, 音频 aac / opus / mp3 ...), 原样返回 ``UpstreamPlaybackTarget`` 跳上游,
-  不经过转码, 画质不变, 可以任意跳转.
-- **转码**: 其余来源由本插件调用 ffmpeg 从 URL 拉流, 实时转成 HLS (fMP4 分片), 分片经
-  回环 HTTP 交给 Amane 反代给播放器. aac 音轨重编码对齐分片边界; 视频一律重编码成
-  h264/hevc (NVENC / QSV 硬件编码优先, 自动探测与回退), 并按分辨率加码率上限.
+- **直连通路**: 容器与编码浏览器都能解码时 (mp4 / m4v / mov / webm / ogv, 视频 h264 / vp8 /
+  vp9 / av1, 音频 aac / opus / mp3 ...), 经 resolver 换成网盘直链, 原样返回
+  ``UpstreamPlaybackTarget`` 跳上游, 不转码, 画质不变, 可以任意跳转.
+- **转码通路**: 其余文件由本插件调用 ffmpeg 实时转成 HLS (fMP4 分片), 分片经回环 HTTP 交给
+  Amane 反代给播放器. ffmpeg **优先从网盘直链 URL 拉流** (避免走 FUSE 双重中转), resolver
+  失败时回退读本机挂载路径. aac 音轨重编码对齐分片边界; 视频一律重编码成 h264/hevc (有 N 卡走
+  NVENC, 并按分辨率加 ``-maxrate`` 上限), NVENC / QSV 自动选择, ffmpeg 自动下载部署.
+
+路径 -> 后端的映射由插件设置项 ``mounts`` 决定 (最长前缀匹配, 多组): ``/mnt/115`` 对应
+``alist: http://alist.xxx`` 之类. AList 走 ``POST /api/fs/get`` 现签 ``dlink`` 直链 (sign 带时效,
+**不缓存**, 每次播放请求现解析现跳); WebDAV 直接拼 HTTP 地址; 其它后端可在此扩展. 每个挂载可
+单独关闭直链 (``allow_direct=False``), 该挂载一律读本机路径.
 
 转码流交给播放器的是一份**完整的 VOD 清单**: 总时长由 ffmpeg 读出的时长决定, 一次给全,
 播放器可以拖到任意位置 —— 要哪一段, 插件就把 ffmpeg 用 ``-ss`` 起转到哪一段. 播放器关掉后
 ffmpeg 由清理任务结束, 已转好的分片留在缓存里复用, 超过 ``idle_timeout`` 秒没人用才删除.
+同目录下与视频同名的 ``.srt`` / ``.vtt`` 会作为字幕轨道列出 (srt 转成 WebVTT).
 
-媒体 URL 不由本插件猜: 由设置项 ``resolver_url`` 指向的解析接口按条目番号
-(``{number}``) 返回, 返回 JSON 或纯文本 URL; 解析器也可以为每条流附带字幕地址
-(srt / vtt / ass 自动转 WebVTT). 具体上游完全由配置决定, 插件本身不内置任何站点.
-
-样本 ``nas.local`` 的「原画直出」通路依赖本机 mp4 关键帧表, 对在线源不可用, 本插件不实现;
-浏览器可解码的在线源由**直连通路**覆盖, 不再保留 HLS copy 档.
+样本 ``nas.local`` 的「原画直出」通路依赖本机 mp4 关键帧表, 本插件不实现; 浏览器可解码文件由
+**直连通路**覆盖.
 """
 
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import ctypes
 import hashlib
@@ -54,9 +58,11 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 try:  # 打包版同样提供这两个入口, 优先用作者 SDK 路径
     from amane.plugin import (  # type: ignore[import-not-found]
         FailureReason,
+        FilePlaybackTarget,
         HlsLocator,
         HlsPlaybackTarget,
         HlsPlaylist,
+        PlaybackMediaFile,
         PlaybackOffer,
         PlaybackPlugin,
         PlaybackProvider,
@@ -71,9 +77,11 @@ try:  # 打包版同样提供这两个入口, 优先用作者 SDK 路径
 except ImportError:  # pragma: no cover
     from amane.net.errors import FailureReason, SourceError  # type: ignore[no-redef]
     from amane.plugins.api import (  # type: ignore[no-redef]
+        FilePlaybackTarget,
         HlsLocator,
         HlsPlaybackTarget,
         HlsPlaylist,
+        PlaybackMediaFile,
         PlaybackOffer,
         PlaybackPlugin,
         PlaybackProvider,
@@ -350,6 +358,56 @@ QUALITY_LEVELS: tuple[tuple[int, str], ...] = (
     (360, "360P"),
 )
 
+MountBackend = Literal["alist", "webdav"]
+
+
+class MountConfig(BaseModel):
+    """一组"本地挂载前缀 -> 网盘后端"映射."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    local_prefix: str = Field(
+        min_length=1,
+        title="本地路径前缀",
+        description="docker 内看到的挂载路径前缀, 如 /mnt/115; 最长前缀匹配",
+    )
+    backend: MountBackend = Field(
+        default="alist",
+        title="后端类型",
+        description="alist: 走 AList API 现签直链 (覆盖 115/夸克等所有 AList 支持的网盘); webdav: 直接拼 HTTP 地址",
+    )
+    address: str = Field(
+        default="",
+        title="后端地址",
+        description="alist: http://alist:5244; webdav: https://dav.xxx/dav (到挂载根为止)",
+    )
+    remote_prefix: str = Field(
+        default="/",
+        title="远端路径前缀",
+        description="后端内该挂载对应的起始路径, 如 /115; 留空 = 后端根",
+    )
+    token: str = Field(
+        default="",
+        title="访问令牌",
+        description="alist: AList 令牌; webdav: 密码. 只填在运行配置里, 绝不入库",
+    )
+    username: str = Field(
+        default="",
+        title="WebDAV 用户名",
+        description="仅 webdav 后端使用; alist 留空",
+    )
+    allow_direct: bool = Field(
+        default=True,
+        title="允许直链直连",
+        description="开启后浏览器可解码的文件解析成网盘直链跳上游 (302 通路); 关闭后该挂载一律读本机路径",
+    )
+    prefer_url_transcode: bool = Field(
+        default=True,
+        title="转码优先读直链",
+        description="转码时 ffmpeg 优先从 http 直链拉流 (避免 FUSE 双重中转); 解析失败自动回退本机挂载路径",
+    )
+
+
 class PluginSettings(BaseModel):
     """插件配置. 全部有默认值, 不填也能用.
 
@@ -360,33 +418,17 @@ class PluginSettings(BaseModel):
 
     model_config = ConfigDict(extra="ignore")
 
-    resolver_url: str = Field(
-        default="",
-        title="解析接口地址",
-        description=(
-            "必填. GET 请求地址, 用 {number} 占位条目番号, 例如 http://nas:8096/resolve/{number}."
-            " 返回 JSON: {\"streams\": [{\"url\", \"name\"?, \"headers\"?, "
-            "\"subtitles\": [{\"id\"?, \"label\", \"language\"?, \"url\"}]}]} 或直接返回纯文本媒体 URL."
-        ),
-    )
-    resolver_token: str = Field(
-        default="",
-        title="解析接口令牌",
-        description="非空时作为 Authorization: Bearer <令牌> 发给解析接口; 令牌只写在运行配置里, 绝不入库",
-    )
-    resolver_timeout: float = Field(
-        default=10.0,
-        ge=1.0,
-        le=60.0,
-        title="解析超时 (秒)",
-        description="解析接口多久不响应就放弃",
+    mounts: list[MountConfig] = Field(
+        default_factory=list,
+        title="挂载映射",
+        description="本地路径前缀 -> 网盘后端的多组映射, 最长前缀匹配; 不配则全部按本机文件处理",
     )
     direct_play: bool = Field(
         default=True,
         title="允许直连播放",
         description=(
-            "开启后, 浏览器能解码的在线源 (容器/编码直通) 直接跳上游播放, 不转码;"
-            " 关闭则所有来源一律走转码 HLS"
+            "开启后, 容器/编码浏览器都能解码的文件解析成网盘直链直连, 不转码;"
+            " 关闭则所有文件一律走转码 HLS"
         ),
     )
     ffmpeg_path: str = Field(
@@ -1038,6 +1080,101 @@ def segment_seconds(codecs: MediaCodecs | None) -> float:
 def total_segments(duration: float, seconds: float) -> int:
     """整部片子按 ``seconds`` 一刀切会有多少段."""
     return max(1, math.ceil(duration / seconds - 0.05))
+
+# ---------------------------------------------------------------------------
+# 挂载解析器: 本地路径 -> 网盘直链
+# ---------------------------------------------------------------------------
+
+RESOLVE_TIMEOUT_SECONDS = 10.0
+
+
+@dataclass(frozen=True, slots=True)
+class MountTarget:
+    """一个本地路径解析出的上游目标."""
+
+    url: str
+    headers: dict[str, str]
+
+
+def _match_mount(settings: PluginSettings, path: Path) -> MountConfig | None:
+    """按最长前缀在 ``mounts`` 里找挂载配置; 找不到返回 ``None`` (按本机文件处理)."""
+    raw = str(path)
+    best: MountConfig | None = None
+    best_len = -1
+    for mount in settings.mounts:
+        prefix = mount.local_prefix.rstrip("/") or "/"
+        if raw == prefix or raw.startswith(prefix + "/") or (prefix == "/" and raw.startswith("/")):
+            if len(prefix) > best_len:
+                best = mount
+                best_len = len(prefix)
+    return best
+
+
+def _remote_path(mount: MountConfig, path: Path) -> str:
+    """本地路径去掉 ``local_prefix`` 后接到 ``remote_prefix`` 之下."""
+    prefix = mount.local_prefix.rstrip("/")
+    raw = str(path)
+    relative = raw[len(prefix):] if prefix and raw.startswith(prefix) else raw
+    remote_prefix = mount.remote_prefix.rstrip("/")
+    combined = (remote_prefix + "/" + relative.lstrip("/")).lstrip("/")
+    return "/" + combined
+
+
+def _alist_dlink(mount: MountConfig, remote: str) -> str | None:
+    """AList ``POST /api/fs/get`` 现签 ``dlink`` 直链. 不带缓存: sign 有时效, 每次现签.
+
+    AList 的 ``raw_url`` 是已签名的下载直链; ``url`` 是带 sign 参数的代理地址, 作兜底.
+    """
+    address = mount.address.rstrip("/")
+    if not address:
+        return None
+    body = json.dumps({"path": remote}).encode("utf-8")
+    request = urllib.request.Request(
+        f"{address}/api/fs/get",
+        data=body,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": mount.token,
+            "User-Agent": "Mozilla/5.0 amane-plugin",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=RESOLVE_TIMEOUT_SECONDS) as response:
+            payload = json.loads(response.read().decode("utf-8", "replace"))
+    except (OSError, ValueError, urllib.error.URLError, TimeoutError):
+        return None
+    if payload.get("code") != 200:
+        return None
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        return None
+    url = data.get("raw_url") or data.get("url")
+    return str(url) if url else None
+
+
+def _webdav_target(mount: MountConfig, remote: str) -> MountTarget | None:
+    """WebDAV: 地址 + 转义后的远端路径; 有用户名就做 Basic 认证."""
+    address = mount.address.rstrip("/")
+    if not address:
+        return None
+    quoted = "/".join(urllib.parse.quote(part) for part in remote.split("/"))
+    url = f"{address}/{quoted.lstrip('/')}"
+    headers: dict[str, str] = {}
+    if mount.username or mount.token:
+        credential = f"{mount.username}:{mount.token}".encode("utf-8")
+        headers["Authorization"] = "Basic " + base64.b64encode(credential).decode("ascii")
+    return MountTarget(url=url, headers=headers)
+
+
+def resolve_mount(mount: MountConfig, path: Path) -> MountTarget | None:
+    """把一个本地路径解析成上游目标; 解析不了返回 ``None`` (调用方回退本机路径)."""
+    remote = _remote_path(mount, path)
+    if mount.backend == "alist":
+        url = _alist_dlink(mount, remote)
+        return MountTarget(url=url, headers={}) if url else None
+    if mount.backend == "webdav":
+        return _webdav_target(mount, remote)
+    return None
 def _mp4_boxes(data: bytes, start: int, end: int):
     pos = start
     while pos + 8 <= end:
@@ -2019,8 +2156,11 @@ class SourceContext:
 
     token: str
     cache_root: Path
+    #: ffmpeg 输入: 优先网盘直链 URL, 解析失败时为本机挂载路径字符串.
     url: str
     headers: dict[str, str]
+    #: 本机路径: 字幕扫描用 (与 ffmpeg 输入无关).
+    local_path: Path
     codecs: MediaCodecs | None
     duration: float
     seconds: float
@@ -2079,6 +2219,7 @@ class StreamServer:
         cache_root: Path,
         url: str,
         headers: dict[str, str],
+        local_path: Path,
         codecs: MediaCodecs | None,
         duration: float,
         seconds: float,
@@ -2094,6 +2235,7 @@ class StreamServer:
             cache_root=cache_root,
             url=url,
             headers=dict(headers),
+            local_path=local_path,
             codecs=codecs,
             duration=duration,
             seconds=seconds,
@@ -3053,33 +3195,17 @@ def _master_text(source: SourceContext) -> str:
         )
         lines.append(f"h264/{uri}")
     return "\n".join(lines) + "\n"
-
-_SUBTITLE_FETCH_TIMEOUT = 15.0
-
-
-def _fetch_text(url: str, headers: dict[str, str] | None = None) -> str | None:
-    """GET 一个文本资源 (字幕 / 解析接口). 失败返回 ``None``, 不抛异常."""
-    request = urllib.request.Request(
-        url,
-        headers={"User-Agent": "Mozilla/5.0 amane-plugin", **(headers or {})},
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=_SUBTITLE_FETCH_TIMEOUT) as response:
-            return response.read().decode("utf-8", "replace")
-    except (OSError, ValueError, urllib.error.URLError, TimeoutError):
-        return None
-
-
 async def _subtitle_vtt(source: SourceContext, track_id: str) -> str | None:
-    """按 track_id 拉取 resolver 给出的字幕 URL, 转成 WebVTT 文本."""
-    located = source.subtitle_sources.get(track_id)
-    if located is None:
-        return None
-    url, suffix = located
-    text = await asyncio.to_thread(_fetch_text, url, source.headers or None)
-    if text is None:
-        return None
-    return _subtitle_to_vtt(text, suffix)
+    """按 track_id 读取本机同名字幕文件, 转成 WebVTT 文本."""
+    for index, (path, suffix) in enumerate(_scan_subtitles(source.local_path)):
+        if f"s{index}" != track_id:
+            continue
+        try:
+            text = await asyncio.to_thread(path.read_text, "utf-8", "replace")
+        except OSError:
+            return None
+        return _subtitle_to_vtt(text, suffix)
+    return None
 
 
 class OnlineHlsLocator(HlsLocator):
@@ -3100,6 +3226,31 @@ class OnlineHlsLocator(HlsLocator):
         if parsed.scheme != "http" or parsed.hostname != LOOPBACK or parsed.port != _SERVER.port:
             raise SourceError(FailureReason.NO_USABLE_METADATA, detail="播放列表 URI 不受支持")
         return UpstreamPlaybackTarget(url=uri, content_type="video/mp4")
+def _scan_subtitles(video: Path) -> tuple[tuple[Path, str], ...]:
+    """扫描视频同目录的所有常见字幕文件 (不限于同名), 返回 (路径, 后缀) 列表."""
+    directory = video.parent
+    try:
+        candidates = sorted(directory.iterdir(), key=lambda p: p.name.casefold())
+    except OSError:
+        return ()
+    found: list[tuple[Path, str]] = []
+    for path in candidates:
+        if not path.is_file():
+            continue
+        suffix = path.suffix.casefold()
+        if suffix in SUBTITLE_SUFFIXES:
+            found.append((path, suffix))
+    return tuple(found)
+
+
+def _subtitle_tracks(video: Path) -> tuple[SubtitleTrack, ...]:
+    """把同目录所有字幕文件列成可选轨道, id 用索引 s0/s1/... 与 subtitle 路由对应."""
+    tracks: list[SubtitleTrack] = []
+    for path, _suffix in _scan_subtitles(video):
+        tracks.append(SubtitleTrack(id=f"s{len(tracks)}", label=path.name, language=None))
+    return tuple(tracks)
+
+
 def _ass_ts_to_sec(ts: str) -> float:
     h, m, s = ts.split(":", 2)
     return int(h) * 3600 + int(m) * 60 + float(s)
@@ -3167,133 +3318,23 @@ def _srt_to_vtt(text: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _stream_key(index: int) -> str:
-    """流的标识: 只进路径, 用序号而不是 URL (URL 含特殊字符, 不能进路径)."""
-    return f"s{index}"
+def _stream_key(file_id: int) -> str:
+    """流的标识: 只进路径, 因此用文件 id 而不是文件名."""
+    return f"f{file_id}"
 
 
-def _subtitle_suffix(url: str) -> str:
-    """从字幕 URL 猜格式后缀; 认不出按 srt 处理 (srt -> vtt 转换对纯文本最保守)."""
-    suffix = Path(urlparse(url).path).suffix.casefold()
-    return suffix if suffix in SUBTITLE_SUFFIXES else ".srt"
-
-
-def _safe_track_id(raw: object, fallback: str) -> str:
-    """字幕轨 id 必须匹配 ``[a-zA-Z0-9._-]{1,64}``, 否则退到兜底值."""
-    text = str(raw or "").strip()
-    if text and re.fullmatch(r"[a-zA-Z0-9._-]{1,64}", text):
-        return text
-    return fallback
-
-
-@dataclass(frozen=True, slots=True)
-class ResolvedSubtitle:
-    """resolver 返回的一条字幕轨."""
-
-    id: str
-    label: str
-    language: str | None
-    url: str
-    suffix: str
-
-
-@dataclass(frozen=True, slots=True)
-class ResolvedStream:
-    """resolver 返回的一条可播流."""
-
-    url: str
-    name: str
-    headers: dict[str, str]
-    subtitles: tuple[ResolvedSubtitle, ...]
-
-
-def _subtitles_from_json(raw: object, stream_index: int) -> tuple[ResolvedSubtitle, ...]:
-    """解析 resolver 返回的字幕列表; 每项至少要有 ``url``."""
-    if not isinstance(raw, list):
-        return ()
-    tracks: list[ResolvedSubtitle] = []
-    for position, item in enumerate(raw):
-        if not isinstance(item, dict):
-            continue
-        url = str(item.get("url") or "").strip()
-        if not url:
-            continue
-        fallback = f"s{stream_index}x{position}"
-        name = str(item.get("label") or "").strip() or Path(urlparse(url).path).name or fallback
-        language = item.get("language")
-        tracks.append(
-            ResolvedSubtitle(
-                id=_safe_track_id(item.get("id"), fallback),
-                label=name,
-                language=str(language).strip() if language else None,
-                url=url,
-                suffix=_subtitle_suffix(url),
-            )
-        )
-    return tuple(tracks)
-
-
-def _streams_from_json(data: object, base_headers: dict[str, str]) -> tuple[ResolvedStream, ...]:
-    """解析 resolver 的 JSON 响应.
-
-    支持三种形态::
-
-        {"streams": [{"url", "name"?, "headers"?, "subtitles"?}, ...]}
-        {"url": "...", "name"?: ..., "subtitles"?: [...]}   # 单流
-        [{"url": ...}, ...]                                 # 顶层数组
-
-    每条流可以带自己的 ``headers`` (合并到解析请求头之上, 用于给具体上游带鉴权).
-    """
-    if isinstance(data, dict):
-        if isinstance(data.get("streams"), list):
-            items: object = data["streams"]
-        elif data.get("url"):
-            items = [data]
-        else:
-            return ()
-    elif isinstance(data, list):
-        items = data
-    else:
-        return ()
-    streams: list[ResolvedStream] = []
-    for index, item in enumerate(items):
-        if not isinstance(item, dict):
-            continue
-        url = str(item.get("url") or "").strip()
-        if not url:
-            continue
-        headers = dict(base_headers)
-        extra = item.get("headers")
-        if isinstance(extra, dict):
-            headers.update({str(key): str(value) for key, value in extra.items()})
-        streams.append(
-            ResolvedStream(
-                url=url,
-                name=str(item.get("name") or "").strip(),
-                headers=headers,
-                subtitles=_subtitles_from_json(item.get("subtitles"), index),
-            )
-        )
-    return tuple(streams)
-
-
-def _parse_resolver_payload(text: str, base_headers: dict[str, str]) -> tuple[ResolvedStream, ...]:
-    """解析 resolver 的响应体: JSON 按结构解析, 否则整段按纯文本媒体 URL 处理."""
-    stripped = text.strip()
-    if not stripped:
-        return ()
-    if stripped.startswith("{") or stripped.startswith("["):
-        try:
-            data = json.loads(stripped)
-        except ValueError:
-            logger.warning("resolver 返回的 JSON 无法解析")
-            return ()
-        return _streams_from_json(data, base_headers)
-    return (ResolvedStream(url=stripped, name="", headers=dict(base_headers), subtitles=()),)
+def _file_by_key(query: PlaybackQuery, key: str | None):
+    """按选中 key 找文件; 认不出返回 ``None``."""
+    if not key:
+        return None
+    for item in query.files:
+        if _stream_key(item.id) == key:
+            return item
+    return None
 
 
 class OnlineProvider(PlaybackProvider):
-    """把 resolver 解析出的在线媒体 URL 逐条列为可播流."""
+    """把条目索引到的本机挂载文件逐条列为可播流, 播放时按挂载映射解析网盘直链."""
 
     def __init__(self, context: PluginContext, settings: PluginSettings) -> None:
         self._settings = settings
@@ -3302,8 +3343,6 @@ class OnlineProvider(PlaybackProvider):
         self._tools: Tools | None = None
         self._tools_ready = False
         self._tools_lock = asyncio.Lock()
-        #: 番号 -> (解析时刻, 流列表). 按 ``RESOLVE_TTL_SECONDS`` 复用, 减轻解析接口压力.
-        self._resolver_cache: dict[str, tuple[float, tuple[ResolvedStream, ...]]] = {}
 
     @property
     def cache_root(self) -> Path:
@@ -3325,172 +3364,165 @@ class OnlineProvider(PlaybackProvider):
                 self._tools_ready = True
         return self._tools
 
-    # -- 解析器 ---------------------------------------------------------
+    # -- 挂载解析 -------------------------------------------------------
 
-    def _resolver_headers(self) -> dict[str, str]:
-        token = self._settings.resolver_token.strip()
-        return {"Authorization": f"Bearer {token}"} if token else {}
+    def _mount_for(self, path: Path) -> MountConfig | None:
+        return _match_mount(self._settings, path)
 
-    async def _streams(self, query: PlaybackQuery) -> tuple[ResolvedStream, ...]:
-        """按条目番号向解析接口要媒体 URL; 结果按番号缓存."""
-        number = (query.number or "").strip()
-        if not number:
-            return ()
-        template = self._settings.resolver_url.strip()
-        if not template:
-            return ()
-        now = time.monotonic()
-        cached = self._resolver_cache.get(number)
-        if cached is not None and now - cached[0] < RESOLVE_TTL_SECONDS:
-            return cached[1]
-        url = template.replace("{number}", urllib.parse.quote(number, safe=""))
-        headers = self._resolver_headers()
-        try:
-            text = await asyncio.to_thread(
-                _fetch_text, url, {**headers, "Accept": "application/json, text/plain, */*"}
-            )
-        except Exception:  # pragma: no cover - _fetch_text 本身不抛, 防御
-            text = None
-        if text is None:
-            logger.warning("解析接口请求失败: %s", url)
-            return ()
-        streams = _parse_resolver_payload(text, headers)
-        if len(self._resolver_cache) >= _CODEC_CACHE_SIZE:
-            self._resolver_cache.clear()
-        self._resolver_cache[number] = (now, streams)
-        return streams
+    async def _mount_target(self, path: Path) -> MountTarget | None:
+        """解析网盘直链; 未配置挂载 / 解析失败返回 ``None`` (调用方回退本机路径)."""
+        mount = self._mount_for(path)
+        if mount is None:
+            return None
+        return await asyncio.to_thread(resolve_mount, mount, path)
 
     # -- 探测 -----------------------------------------------------------
 
-    async def _codecs(self, stream: ResolvedStream, tools: Tools | None) -> MediaCodecs | None:
+    async def _codecs(self, path: Path, tools: Tools | None) -> MediaCodecs | None:
         if tools is None:
             return None
-        header_tag = "|".join(f"{k}:{v}" for k, v in sorted(stream.headers.items()))
-        cache_key = f"{stream.url}|{header_tag}"
+        try:
+            stat = await asyncio.to_thread(path.stat)
+        except OSError:
+            return None
+        cache_key = f"{path}|{stat.st_mtime_ns}|{stat.st_size}"
         if cache_key in _CODEC_CACHE:
             return _CODEC_CACHE[cache_key]
-        probed = await asyncio.to_thread(_probe_codecs, tools.ffmpeg, stream.url, stream.headers)
+        probed = await asyncio.to_thread(_probe_codecs, tools.ffmpeg, str(path))
         _cache_codecs(cache_key, probed)
         return probed
 
     @staticmethod
     def _codecs_playable(codecs: MediaCodecs | None) -> bool:
         if codecs is None:
-            # 探测失败不阻塞: 按可播处理, 让直连/上游自己去试 (直连失败播放器会报错,
-            # 转码失败由 resolve 阶段的 SourceError 兜底).
             return True
         if codecs.video is not None and codecs.video not in BROWSER_SAFE_VIDEO:
             return False
         return codecs.audio is None or codecs.audio in BROWSER_SAFE_AUDIO
 
-    async def _plan(self, stream: ResolvedStream, tools: Tools | None) -> Plan:
-        """判定一条流怎么播: 直连 (浏览器可解码) / 转码 HLS / 不可播."""
-        suffix = Path(urlparse(stream.url).path).suffix.casefold()
+    async def _plan(self, path: Path, tools: Tools | None) -> Plan:
+        """判定一条文件怎么播: 直链直连 / 转码 HLS / 不可播."""
+        suffix = path.suffix.casefold()
         reason = NOT_MEDIA.get(suffix)
         if reason is not None:
             return Plan("unavailable", unavailable=reason)
         direct_type = DIRECT_TYPES.get(suffix)
-        if tools is not None and self._settings.direct_play and direct_type is not None:
-            codecs = await self._codecs(stream, tools)
-            if self._codecs_playable(codecs):
-                return Plan("direct", content_type=direct_type)
         if tools is not None:
+            if self._settings.direct_play and direct_type is not None:
+                codecs = await self._codecs(path, tools)
+                if self._codecs_playable(codecs):
+                    # 有可解析直链的挂载在 resolve 时跳上游; 否则回退本机 FilePlaybackTarget.
+                    return Plan("direct", content_type=direct_type)
             return Plan("hls", content_type=HLS_CONTENT_TYPE)
-        if direct_type is not None:
-            codecs = await self._codecs(stream, tools)
+        # 没有 ffmpeg: 浏览器能直解的直接给 (尊重 direct_play 开关), 否则不可播.
+        if self._settings.direct_play and direct_type is not None:
+            codecs = await self._codecs(path, tools)
             if self._codecs_playable(codecs):
                 return Plan("direct", content_type=direct_type)
         detail = (
-            "浏览器无法解码此来源, 且未找到 ffmpeg"
+            "浏览器无法解码此格式, 且未找到 ffmpeg"
             if direct_type is None
-            else "浏览器无法解码此来源的编码, 且未找到 ffmpeg"
+            else "浏览器无法解码此文件的编码, 且未找到 ffmpeg"
         )
         return Plan("unavailable", content_type=direct_type or "video/mp4", unavailable=detail)
 
     # -- 探流 -----------------------------------------------------------
 
     async def probe(self, query: PlaybackQuery) -> tuple[PlaybackOffer, ...]:
-        streams = await self._streams(query)
-        if not streams:
-            raise SourceError(
-                FailureReason.NO_USABLE_METADATA,
-                detail="解析器没有返回可播放的媒体地址",
-            )
+        if not query.files:
+            return ()
         tools = await self._resolve_tools()
-        offers: list[PlaybackOffer] = []
-        for index, stream in enumerate(streams):
-            plan = await self._plan(stream, tools)
-            subtitles = tuple(
-                SubtitleTrack(id=sub.id, label=sub.label, language=sub.language)
-                for sub in stream.subtitles
+
+        async def build(item: PlaybackMediaFile) -> PlaybackOffer:
+            path = Path(item.path)
+            plan = await self._plan(path, tools)
+            unavailable = plan.unavailable
+            if unavailable is None:
+                exists = await asyncio.to_thread(path.is_file)
+                if not exists:
+                    unavailable = "文件不在磁盘上"
+                elif item.size is not None and item.size <= 0:
+                    unavailable = "文件为空"
+            subtitles: tuple[SubtitleTrack, ...] = ()
+            if unavailable is None:
+                subtitles = await asyncio.to_thread(_subtitle_tracks, path)
+            return PlaybackOffer(
+                key=_stream_key(item.id),
+                name=path.name,
+                content_type=plan.content_type,
+                seekable=plan.seekable,
+                unavailable=unavailable,
+                subtitles=subtitles,
             )
-            name = stream.name or Path(urlparse(stream.url).path).name or f"流 {index + 1}"
-            offers.append(
-                PlaybackOffer(
-                    key=_stream_key(index),
-                    name=name,
-                    content_type=plan.content_type,
-                    seekable=plan.seekable,
-                    unavailable=plan.unavailable,
-                    subtitles=subtitles,
-                )
-            )
-        return tuple(offers)
+
+        return tuple(await asyncio.gather(*(build(item) for item in query.files)))
 
     # -- 取流 -----------------------------------------------------------
 
-    async def resolve(self, query: PlaybackQuery) -> UpstreamPlaybackTarget | HlsPlaybackTarget | None:
-        """返回选中那条流对应的播放目标; 没指定时挑第一条."""
-        streams = await self._streams(query)
-        if not streams:
-            return None
-        index = 0
-        key = (query.selected_key or "").strip()
-        if key:
-            match = re.fullmatch(r"s(\d+)", key)
-            if match is not None:
-                index = int(match.group(1))
-        if index >= len(streams):
-            index = 0
-        stream = streams[index]
+    async def resolve(self, query: PlaybackQuery):
+        """返回选中那条流对应的播放目标; 没指定时挑第一条能播的."""
         tools = await self._resolve_tools()
-        plan = await self._plan(stream, tools)
+        selected = _file_by_key(query, query.selected_key)
+        if selected is None:
+            for item in query.files:
+                path = Path(item.path)
+                plan = await self._plan(path, tools)
+                if plan.kind != "unavailable" and await asyncio.to_thread(path.is_file):
+                    selected = item
+                    break
+        if selected is None:
+            return None
+        path = Path(selected.path)
+        plan = await self._plan(path, tools)
         if plan.kind == "unavailable":
             raise SourceError(FailureReason.NO_USABLE_METADATA, detail=plan.unavailable or "没有可播放的流")
         if plan.kind == "direct":
-            # 直连: 原样跳上游, 不经过转码. 由主机反代转发上游字节 (鉴权头由 resolver 给出).
-            return UpstreamPlaybackTarget(
-                url=stream.url,
-                headers=stream.headers,
-                content_type=plan.content_type,
-                cache_ttl=RESOLVE_TTL_SECONDS,
-            )
-        return await self._transcode_target(stream, tools)
+            return await self._direct_target(path, plan)
+        return await self._transcode_target(path, tools)
 
-    async def _transcode_target(self, stream: ResolvedStream, tools: Tools | None) -> HlsPlaybackTarget:
+    async def _direct_target(self, path: Path, plan: Plan):
+        """直连通路: 挂载允许直链时解析网盘直链跳上游; 否则 / 解析失败回退主机 FilePlaybackTarget."""
+        mount = self._mount_for(path)
+        if mount is not None and mount.allow_direct:
+            target = await self._mount_target(path)
+            if target is not None:
+                # 直链 sign 有时效: 不声明 cache_ttl, 每次取流都重新解析现签现跳.
+                return UpstreamPlaybackTarget(url=target.url, headers=target.headers, content_type=plan.content_type)
+        return FilePlaybackTarget(path=path, content_type=plan.content_type, cache_ttl=RESOLVE_TTL_SECONDS)
+
+    async def _transcode_target(self, path: Path, tools: Tools | None) -> HlsPlaybackTarget:
         if tools is None:
-            raise SourceError(FailureReason.NO_USABLE_METADATA, detail="未找到 ffmpeg, 无法转码播放此来源")
-        codecs = await self._codecs(stream, tools)
+            raise SourceError(FailureReason.NO_USABLE_METADATA, detail="未找到 ffmpeg, 无法转码播放此格式")
+        if not await asyncio.to_thread(path.is_file):
+            raise SourceError(FailureReason.NO_USABLE_METADATA, detail="文件不在磁盘上")
+        codecs = await self._codecs(path, tools)
         duration = codecs.duration if codecs is not None else None
         if duration is None or duration <= 0:
             raise SourceError(FailureReason.NO_USABLE_METADATA, detail="读不出这部片子的时长, 无法转码播放")
+        # 转码输入: 挂载允许直链时优先网盘直链 (避免 FUSE 双重中转), 否则读本机挂载路径.
+        source_input = str(path)
+        headers: dict[str, str] = {}
+        mount = self._mount_for(path)
+        if mount is not None and mount.allow_direct and mount.prefer_url_transcode:
+            target = await self._mount_target(path)
+            if target is not None:
+                source_input = target.url
+                headers = target.headers
         settings = self._settings
         seconds = segment_seconds(codecs)
         cache_root = await asyncio.to_thread(self._prepare_cache)
         source = await _SERVER.register_source(
             cache_root=cache_root,
-            url=stream.url,
-            headers=stream.headers,
+            url=source_input,
+            headers=headers,
+            local_path=path,
             codecs=codecs,
             duration=duration,
             seconds=seconds,
             settings=settings,
             tools=tools,
-            subtitles=tuple(
-                SubtitleTrack(id=sub.id, label=sub.label, language=sub.language)
-                for sub in stream.subtitles
-            ),
-            subtitle_sources={sub.id: (sub.url, sub.suffix) for sub in stream.subtitles},
+            subtitles=await asyncio.to_thread(_subtitle_tracks, path),
+            subtitle_sources={},
             preferred_height=0,
         )
         # 预创建原画档会话: 起播即转好第一段, 其它档位等播放器切换时懒创建.
@@ -3503,20 +3535,25 @@ class OnlineProvider(PlaybackProvider):
         return self._cache_root
 
     async def subtitle(self, query: PlaybackQuery, track_id: str) -> str | None:
-        streams = await self._streams(query)
-        for stream in streams:
-            for sub in stream.subtitles:
-                if sub.id != track_id:
-                    continue
-                text = await asyncio.to_thread(_fetch_text, sub.url, stream.headers or None)
-                if text is None:
-                    return None
-                return _subtitle_to_vtt(text, sub.suffix)
+        selected = _file_by_key(query, query.selected_key)
+        if selected is None and query.files:
+            selected = query.files[0]
+        if selected is None:
+            return None
+        video = Path(selected.path)
+        for index, (path, suffix) in enumerate(_scan_subtitles(video)):
+            if f"s{index}" != track_id:
+                continue
+            try:
+                text = await asyncio.to_thread(path.read_text, "utf-8", "replace")
+            except OSError:
+                return None
+            return _subtitle_to_vtt(text, suffix)
         return None
 
 
 class Plugin(PlaybackPlugin):
-    """在线媒体播放源插件."""
+    """网盘挂载播放源插件."""
 
     config_model = PluginSettings
 
@@ -3524,8 +3561,8 @@ class Plugin(PlaybackPlugin):
     def descriptor(cls) -> SourceDescriptor:
         return SourceDescriptor(
             id=SOURCE_ID,
-            name="在线播放",
-            version="0.1.0",
+            name="网盘挂载",
+            version="0.2.0",
             api_version="1",
             capabilities=frozenset({SourceCapability.PLAYBACK}),
         )

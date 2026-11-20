@@ -118,6 +118,47 @@ def test_probe_codecs_from_url(media_url: str) -> None:
     assert codecs.height == 360
 
 
+def test_transcode_pipeline_from_local_path(tmp_path) -> None:
+    """回退通路: 直链解析不可用时 ffmpeg 直接读本机挂载路径."""
+    source = tmp_path / "src.mkv"
+    subprocess.run(
+        [
+            FFMPEG, "-hide_banner", "-loglevel", "error", "-y",
+            "-f", "lavfi", "-i", "testsrc=duration=6:size=640x360:rate=25",
+            "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+            "-f", "matroska", str(source),
+        ],
+        check=True,
+    )
+
+    async def main() -> None:
+        tools = Tools(ffmpeg=Path(FFMPEG), encoder="libx264")
+        codecs = await asyncio.to_thread(_probe_codecs, tools.ffmpeg, str(source))
+        assert codecs is not None and codecs.duration
+        server = StreamServer()
+        try:
+            registered = await server.register_source(
+                cache_root=tmp_path / "cache-local",
+                url=str(source),  # 回退: 本机路径直接作 ffmpeg 输入
+                headers={},
+                local_path=source,
+                codecs=codecs,
+                duration=codecs.duration,
+                seconds=segment_seconds(codecs),
+                settings=PluginSettings(encoder="cpu", preset="ultrafast"),
+                tools=tools,
+                subtitles=(),
+                subtitle_sources={},
+            )
+            session = await server.session_for(registered, 0)
+            assert session.fragment(0) is not None
+            assert "#EXT-X-ENDLIST" in session.playlist_text()
+        finally:
+            await server.aclose()
+
+    asyncio.run(main())
+
+
 def test_transcode_pipeline_from_url(media_url: str, tmp_path) -> None:
     """完整链路: URL 探测 -> 起转 -> 首段 -> 清单 -> 拖动末段重起转."""
 
@@ -133,6 +174,7 @@ def test_transcode_pipeline_from_url(media_url: str, tmp_path) -> None:
                 cache_root=tmp_path / "cache",
                 url=media_url,
                 headers={},
+                local_path=tmp_path / "src.mp4",
                 codecs=codecs,
                 duration=codecs.duration,
                 seconds=seconds,

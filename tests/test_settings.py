@@ -1,11 +1,11 @@
-"""PluginSettings 校验与归一化测试."""
+"""PluginSettings / MountConfig 校验与归一化测试."""
 
 from __future__ import annotations
 
 import pytest
 from pydantic import ValidationError
 
-from plugin import PluginSettings
+from plugin import MountConfig, PluginSettings
 
 
 def test_defaults_valid() -> None:
@@ -13,7 +13,31 @@ def test_defaults_valid() -> None:
     assert settings.encoder == "auto"
     assert settings.preset == "veryfast"
     assert settings.direct_play is True
-    assert settings.resolver_url == ""
+    assert settings.mounts == []
+
+
+def test_mount_config_defaults() -> None:
+    mount = MountConfig(local_prefix="/mnt/115")
+    assert mount.backend == "alist"
+    assert mount.allow_direct is True
+    assert mount.prefer_url_transcode is True
+    assert mount.remote_prefix == "/"
+
+
+def test_mount_local_prefix_required() -> None:
+    with pytest.raises(ValidationError):
+        MountConfig()  # type: ignore[call-arg]
+
+
+def test_mounts_in_settings() -> None:
+    settings = PluginSettings(
+        mounts=[
+            {"local_prefix": "/mnt/115", "backend": "alist", "address": "http://alist:5244"},
+            {"local_prefix": "/mnt/dav", "backend": "webdav", "address": "https://d/dav"},
+        ]
+    )
+    assert len(settings.mounts) == 2
+    assert settings.mounts[1].backend == "webdav"
 
 
 def test_encoder_aliases_normalized() -> None:
@@ -35,14 +59,6 @@ def test_unknown_preset_falls_back_to_veryfast() -> None:
 def test_extra_keys_ignored() -> None:
     settings = PluginSettings(video_codec="h265", unknown_key=1)  # type: ignore[call-arg]
     assert settings.encoder == "auto"
-
-
-def test_resolver_timeout_bounds() -> None:
-    with pytest.raises(ValidationError):
-        PluginSettings(resolver_timeout=0.5)
-    with pytest.raises(ValidationError):
-        PluginSettings(resolver_timeout=61.0)
-    assert PluginSettings(resolver_timeout=5.0).resolver_timeout == 5.0
 
 
 def test_crf_bounds() -> None:

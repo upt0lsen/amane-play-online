@@ -91,6 +91,7 @@ def _source(codecs: MediaCodecs | None, subtitles=()) -> SourceContext:
         cache_root=Path("/nonexistent"),
         url="http://upstream/video.mkv",
         headers={},
+        local_path=Path("/mnt/115/video.mkv"),
         codecs=codecs,
         duration=100.0,
         seconds=2.0,
