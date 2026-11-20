@@ -89,7 +89,10 @@ upt0lsen.play-online/
   502。因此插件在返回直链前自己做重定向预检：跟随最多 5 跳，终点必须 200/206 且是媒体流
   （错误页 Content-Type 判不可用）；预检不过自动回退本机路径，不把 3xx 甩给主机。
 - **凭据策略**：重定向**同源才带敏感头**——任何一跳 origin（scheme://host:port）变化，
-  立即剥离 `Authorization` 等敏感头再继续，不把 Basic/Bearer 转发给第三方域。
+  立即剥离 `Authorization` 等敏感头再继续，不把 Basic/Bearer 转发给第三方域（AList API
+  同样逐跳处理，不自动跟随）。**ffmpeg 不是凭据边界**：预检只保护预检请求本身，ffmpeg 的
+  真实 GET 遇跨源 302 仍会转发 `-headers` 里的凭据，因此**带凭据的直链一律不交给
+  ffmpeg**，转码输入直接回退本机路径；无凭据直链（alist 签名链）预检通过后正常使用。
 - **302 说明**：amane SDK 的 `UpstreamPlaybackTarget` 是主机反代转发，不是浏览器直连的
   真 302；115/夸克 `/d/` 链接浏览器直访可行性**待实测**（见 PR 待确认问题）。
 - **非法 key**：`selected_key` 认不出时插件拒绝（`SourceError`），不会改播别的文件。

@@ -362,3 +362,125 @@ def test_verify_hop_limit() -> None:
     finally:
         httpd.shutdown()
         httpd.server_close()
+
+
+# ---------------------------------------------------------------------------
+# 预检放行严格化 (萱儿复审 B1/B2)
+# ---------------------------------------------------------------------------
+
+
+def test_verify_rejects_204() -> None:
+    """204 No Content 不是可播媒体: 拒绝 (B1)."""
+
+    class H(_RedirectHandler):
+        pass
+
+    httpd, base = _start_server(H)
+    H.routes = {"/empty.mp4": {"status": 204, "content_type": "video/mp4"}}
+    try:
+        assert _verify_target(MountTarget(url=f"{base}/empty.mp4", headers={})) is None
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+@pytest.mark.parametrize(
+    "content_type",
+    ["image/png", "application/problem+json", "text/html", "application/json"],
+)
+def test_verify_rejects_non_media_content_type(content_type: str) -> None:
+    """非媒体 Content-Type (image/*、+json、text/*) 一律拒绝 (B2 白名单)."""
+
+    class H(_RedirectHandler):
+        pass
+
+    httpd, base = _start_server(H)
+    H.routes = {"/x": {"status": 206, "content_type": content_type}}
+    try:
+        assert _verify_target(MountTarget(url=f"{base}/x", headers={})) is None
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_verify_accepts_octet_stream_and_audio() -> None:
+    """白名单内: video/* / audio/* / application/octet-stream 放行."""
+
+    class H(_RedirectHandler):
+        pass
+
+    httpd, base = _start_server(H)
+    H.routes = {
+        "/a": {"status": 200, "content_type": "application/octet-stream"},
+        "/b": {"status": 206, "content_type": "audio/mp4"},
+    }
+    try:
+        assert _verify_target(MountTarget(url=f"{base}/a", headers={})) is not None
+        assert _verify_target(MountTarget(url=f"{base}/b", headers={})) is not None
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+# ---------------------------------------------------------------------------
+# AList API 跨源凭据回归 (萱儿复审 A1)
+# ---------------------------------------------------------------------------
+
+
+def test_alist_api_cross_origin_strips_authorization() -> None:
+    """POST /api/fs/get 跨源 302: 目标站不得收到 AList 令牌 (A1)."""
+
+    class _Recorder(BaseHTTPRequestHandler):
+        seen_headers: dict = {}
+
+        def do_GET(self) -> None:  # noqa: N802
+            type(self).seen_headers = dict(self.headers)
+            payload = json.dumps(
+                {"code": 200, "data": {"raw_url": "https://cdn.example.com/v.mp4"}}
+            ).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, *args) -> None:
+            pass
+
+    import socketserver
+
+    recorder = socketserver.TCPServer(("127.0.0.1", 0), _Recorder)
+    recorder.timeout = 5
+    threading.Thread(target=recorder.serve_forever, daemon=True).start()
+    recorder_base = f"http://127.0.0.1:{recorder.server_address[1]}"
+
+    class _AlistRedirect(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:  # noqa: N802
+            self.send_response(302)
+            self.send_header("Location", f"{recorder_base}/fs/get")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def log_message(self, *args) -> None:
+            pass
+
+    alist = socketserver.TCPServer(("127.0.0.1", 0), _AlistRedirect)
+    alist.timeout = 5
+    threading.Thread(target=alist.serve_forever, daemon=True).start()
+    try:
+        mount = MountConfig(
+            local_prefix="/m",
+            backend="alist",
+            address=f"http://127.0.0.1:{alist.server_address[1]}",
+            token="DUMMY_ALIST_SECRET",
+        )
+        url = resolve_mount(mount, Path("/m/a.mp4"))
+        # 跨源 302 后仍拿到 dlink (凭据已剥离, 目标站正常返回 JSON)
+        assert url is not None
+        assert url.url == "https://cdn.example.com/v.mp4"
+        assert "Authorization" not in _Recorder.seen_headers
+    finally:
+        alist.shutdown()
+        alist.server_close()
+        recorder.shutdown()
+        recorder.server_close()

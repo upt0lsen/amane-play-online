@@ -1119,8 +1119,13 @@ MAX_REDIRECT_HOPS = 5
 _REDIRECT_CODES = frozenset({301, 302, 303, 307, 308})
 #: 跨源重定向时必须剥离的敏感请求头 (防凭据泄露给第三方 origin).
 _SENSITIVE_HEADER_NAMES = frozenset({"authorization", "proxy-authorization"})
-#: 终态响应里视为错误页的 Content-Type, 命中即判不可用 (回退本机).
-_BAD_CONTENT_TYPES = frozenset({"text/html", "application/json", "text/plain"})
+#: 终态响应里视为错误页的 Content-Type; 预检改为**媒体类型白名单** (萱儿复审 B2):
+#: 只放行 video/* / audio/* / application/octet-stream, 其余 (image/*、+json、text/*)
+#: 一律判不可用, 调用方回退本机路径.
+_MEDIA_CONTENT_PREFIXES = ("video/", "audio/")
+_MEDIA_CONTENT_EXACT = frozenset({"application/octet-stream"})
+#: 预检放行的状态码严格限定 200/206 (萱儿复审 B1: 204 No Content 等一律拒绝).
+_OK_CODES = frozenset({200, 206})
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -1153,6 +1158,17 @@ def _has_dot_segments(path: Path) -> bool:
 
 def _strip_sensitive(headers: dict[str, str]) -> dict[str, str]:
     return {key: value for key, value in headers.items() if key.casefold() not in _SENSITIVE_HEADER_NAMES}
+
+
+def _has_sensitive_headers(headers: dict[str, str]) -> bool:
+    return any(key.casefold() in _SENSITIVE_HEADER_NAMES for key in headers)
+
+
+def _is_media_content_type(content_type: str) -> bool:
+    """媒体类型白名单; 空 Content-Type 放行 (部分服务器不返回, 由状态码兜底)."""
+    if not content_type:
+        return True
+    return content_type.startswith(_MEDIA_CONTENT_PREFIXES) or content_type in _MEDIA_CONTENT_EXACT
 
 
 @dataclass(frozen=True, slots=True)
@@ -1195,35 +1211,58 @@ def _alist_dlink(mount: MountConfig, remote: str) -> str | None:
     AList 的 ``raw_url`` 是已签名的下载直链; ``url`` 是带 sign 参数的代理地址, 作兜底.
     返回的 URL 必须是绝对 http(s), 否则返回 ``None`` (防 alist 被篡改后把
     file:/// concat: 这类 URL 喂给 ffmpeg).
+
+    重定向安全 (萱儿复审 A1): urllib 默认自动跟随重定向且**原样携带请求头**, 会把
+    AList 令牌转发给第三方域. 这里禁止自动重定向, 逐跳手动处理 —— 任何一跳 origin
+    变化立即剥离 Authorization 再继续; 超上限判失败.
     """
     address = mount.address.rstrip("/")
     if _origin_of(address) is None:
         return None
-    body = json.dumps({"path": remote}).encode("utf-8")
-    request = urllib.request.Request(
-        f"{address}/api/fs/get",
-        data=body,
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": mount.token,
-            "User-Agent": "Mozilla/5.0 amane-plugin",
-        },
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=RESOLVE_TIMEOUT_SECONDS) as response:
-            payload = json.loads(response.read().decode("utf-8", "replace"))
-    except (OSError, ValueError, urllib.error.URLError, TimeoutError):
-        return None
-    if payload.get("code") != 200:
-        return None
-    data = payload.get("data")
-    if not isinstance(data, dict):
-        return None
-    url = data.get("raw_url") or data.get("url")
-    if not url:
-        return None
-    url = str(url)
-    return url if _origin_of(url) is not None else None
+    body: bytes | None = json.dumps({"path": remote}).encode("utf-8")
+    url = f"{address}/api/fs/get"
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": mount.token,
+        "User-Agent": "Mozilla/5.0 amane-plugin",
+    }
+    for _ in range(MAX_REDIRECT_HOPS + 1):
+        origin = _origin_of(url)
+        if origin is None:
+            return None
+        request = urllib.request.Request(url, data=body, headers=dict(headers))
+        try:
+            response = _OPENER.open(request, timeout=RESOLVE_TIMEOUT_SECONDS)
+        except urllib.error.HTTPError as exc:
+            if exc.code in _REDIRECT_CODES and exc.headers and exc.headers.get("Location"):
+                new_url = urllib.parse.urljoin(url, exc.headers["Location"])
+                if _origin_of(new_url) != origin:
+                    headers = _strip_sensitive(headers)
+                url = new_url
+                if exc.code in (301, 302, 303):
+                    body = None  # 后续跳按 GET
+                continue
+            return None
+        except (OSError, ValueError, TimeoutError, urllib.error.URLError):
+            return None
+        with contextlib.closing(response):
+            if response.getcode() != 200:
+                return None
+            try:
+                payload = json.loads(response.read().decode("utf-8", "replace"))
+            except (OSError, ValueError):
+                return None
+        if payload.get("code") != 200:
+            return None
+        data = payload.get("data")
+        if not isinstance(data, dict):
+            return None
+        url = data.get("raw_url") or data.get("url")
+        if not url:
+            return None
+        url = str(url)
+        return url if _origin_of(url) is not None else None
+    return None
 
 
 def _webdav_target(mount: MountConfig, remote: str) -> MountTarget | None:
@@ -1299,12 +1338,12 @@ def _verify_target(target: MountTarget) -> MountTarget | None:
         with contextlib.closing(response):
             code = response.getcode()
             final_url = response.geturl()
-            if not (200 <= code < 300):
+            if code not in _OK_CODES:
                 return None
             if _origin_of(final_url) is None:
                 return None
             content_type = (response.headers.get("Content-Type") or "").split(";")[0].strip().casefold()
-            if content_type in _BAD_CONTENT_TYPES:
+            if not _is_media_content_type(content_type):
                 return None
             return MountTarget(url=final_url, headers=headers)
     return None
@@ -3652,15 +3691,7 @@ class OnlineProvider(PlaybackProvider):
         if duration is None or duration <= 0:
             raise SourceError(FailureReason.NO_USABLE_METADATA, detail="读不出这部片子的时长, 无法转码播放")
         # 转码输入: 挂载允许直链时优先网盘直链 (避免 FUSE 双重中转), 否则读本机挂载路径.
-        source_input = str(path)
-        headers: dict[str, str] = {}
-        mount = self._mount_for(path)
-        if mount is not None and mount.allow_direct and mount.prefer_url_transcode:
-            # 预检: 3xx 在插件侧消化, 同源才带凭据; 预检不过回退本机路径.
-            target = await self._verified_target(path)
-            if target is not None:
-                source_input = target.url
-                headers = target.headers
+        source_input, headers = await self._transcode_input(path)
         settings = self._settings
         seconds = segment_seconds(codecs)
         cache_root = await asyncio.to_thread(self._prepare_cache)
@@ -3681,6 +3712,23 @@ class OnlineProvider(PlaybackProvider):
         # 预创建原画档会话: 起播即转好第一段, 其它档位等播放器切换时懒创建.
         await _SERVER.session_for(source, 0)
         return HlsPlaybackTarget(locator=OnlineHlsLocator(source))
+
+    async def _transcode_input(self, path: Path) -> tuple[str, dict[str, str]]:
+        """决定转码 ffmpeg 的输入: 优先直链 URL, 否则本机路径.
+
+        凭据安全 (萱儿复审 A2): 预检 (_verify_target) 只保护预检请求本身, ffmpeg 的
+        真实 GET 遇跨源 302 会把 -headers 里的 Basic/Bearer 转发给第三方域 —— 预检不是
+        凭据边界, ffmpeg 也无法被禁止跟随重定向. 因此**带敏感凭据的直链一律不交给
+        ffmpeg**, 直接回退本机路径; 无凭据直链 (alist 签名链) 预检通过后正常使用.
+        """
+        mount = self._mount_for(path)
+        if mount is not None and mount.allow_direct and mount.prefer_url_transcode:
+            target = await self._verified_target(path)
+            if target is not None:
+                if not _has_sensitive_headers(target.headers):
+                    return target.url, target.headers
+                logger.info("直链带凭据, 转码输入回退本机路径 (防 ffmpeg 重定向泄露凭据): %s", path)
+        return str(path), {}
 
     def _prepare_cache(self) -> Path:
         """转码输出用的目录, 不存在就建."""
