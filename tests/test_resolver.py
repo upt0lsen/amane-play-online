@@ -438,9 +438,22 @@ def test_verify_rejects_partial_without_content_type() -> None:
         httpd.server_close()
 
 
-@pytest.mark.parametrize("content_type", ["video/", "audio/", "video/; charset=binary", "VIDEO/", "  audio/  "])
-def test_verify_rejects_empty_media_subtype(content_type: str) -> None:
-    """video/、audio/ 空子类型 (含参数、大小写、空白变体): 拒绝 (萱儿三审 B2)."""
+@pytest.mark.parametrize(
+    "content_type",
+    [
+        # 空子类型
+        "video/", "audio/", "video/; charset=binary", "VIDEO/", "  audio/  ",
+        # 萱儿四审 必修二: 畸形 subtype 必须全部拒绝
+        "video//",          # 额外斜杠
+        "video/mp4/extra",  # 多余路径段
+        "video/ mp4",       # subtype 内空白
+        "video/mp4,text/html",  # 列表逗号
+        "video/*",          # 通配符
+        "audio/mp4/extra",  # 多余路径段 (audio)
+    ],
+)
+def test_verify_rejects_malformed_media_subtype(content_type: str) -> None:
+    """空 / 畸形 subtype (斜杠、空白、逗号、通配符): 全部拒绝 (萱儿三审 B2 + 四审 必修二)."""
 
     class H(_NoContentTypeHandler):
         pass
@@ -449,6 +462,33 @@ def test_verify_rejects_empty_media_subtype(content_type: str) -> None:
     H.routes = {"/x": {"status": 200, "content_type": content_type}}
     try:
         assert _verify_target(MountTarget(url=f"{base}/x", headers={})) is None
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+@pytest.mark.parametrize(
+    "content_type",
+    [
+        # 萱儿四审 必修二: 合法值必须继续放行
+        "video/x-matroska",
+        "video/mp4;codecs=avc1.640028",
+        "video/mp4; codecs=avc1.42E01E,mp4a.40.2",
+        "audio/mp4; charset=binary",
+        "VIDEO/MP4",
+        "video/quicktime",
+    ],
+)
+def test_verify_accepts_valid_media_subtype(content_type: str) -> None:
+    """合法 subtype (含参数、大小写): 继续放行 (萱儿四审 必修二 回归)."""
+
+    class H(_NoContentTypeHandler):
+        pass
+
+    httpd, base = _start_server(H)
+    H.routes = {"/x": {"status": 206, "content_type": content_type}}
+    try:
+        assert _verify_target(MountTarget(url=f"{base}/x", headers={})) is not None
     finally:
         httpd.shutdown()
         httpd.server_close()

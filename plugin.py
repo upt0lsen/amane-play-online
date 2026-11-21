@@ -1126,6 +1126,15 @@ _MEDIA_MAIN_TYPES = frozenset({"video", "audio"})
 _MEDIA_CONTENT_EXACT = frozenset({"application/octet-stream"})
 #: 预检放行的状态码严格限定 200/206 (萱儿复审 B1: 204 No Content 等一律拒绝).
 _OK_CODES = frozenset({200, 206})
+#: subtype 里的非法字符: 额外斜杠、列表逗号、通配符 (空白单独判, 萱儿四审 必修二).
+_MEDIA_SUBTYPE_BAD_CHARS = frozenset({"/", ",", "*"})
+
+
+def _is_valid_media_subtype(subtype: str) -> bool:
+    """subtype token 严格校验: 非空且不含斜杠 / 逗号 / 通配符 / 任何空白."""
+    if not subtype:
+        return False
+    return not any(ch in _MEDIA_SUBTYPE_BAD_CHARS or ch.isspace() for ch in subtype)
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -1167,8 +1176,9 @@ def _has_sensitive_headers(headers: dict[str, str]) -> bool:
 def _is_media_content_type(content_type: str) -> bool:
     """媒体类型白名单, fail-closed: 缺失 / 空白 / 畸形一律拒绝并回退本机.
 
-    只接受 ``video/<非空子类型>``、``audio/<非空子类型>`` 与 ``application/octet-stream``;
-    空 Content-Type、``video/`` / ``audio/`` 空子类型、其他类型全部拒绝。
+    只接受 ``video/<合法子类型>``、``audio/<合法子类型>`` 与 ``application/octet-stream``;
+    空 Content-Type、空子类型、含额外斜杠 / 空白 / 逗号 / 通配符的子类型全部拒绝
+    (萱儿四审 必修二: 不再用 bool(subtype) 粗判)。
     本机回退已能保播放, 不为直链优化而 fail-open。
     """
     if not content_type or not content_type.strip():
@@ -1178,8 +1188,10 @@ def _is_media_content_type(content_type: str) -> bool:
         return False
     if media_type in _MEDIA_CONTENT_EXACT:
         return True
-    main_type, _, subtype = media_type.partition("/")
-    return main_type in _MEDIA_MAIN_TYPES and bool(subtype)
+    main_type, slash, subtype = media_type.partition("/")
+    if not slash or main_type not in _MEDIA_MAIN_TYPES:
+        return False
+    return _is_valid_media_subtype(subtype)
 
 
 @dataclass(frozen=True, slots=True)
