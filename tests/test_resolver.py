@@ -1243,3 +1243,85 @@ def test_resolve_mount_rejects_raw_dot_slash() -> None:
     assert _has_dot_segments_raw("./y.mp4")
     assert _has_dot_segments_raw("/media/x/../y.mp4")
     assert not _has_dot_segments_raw("/media/x/y.mp4")
+
+
+def test_cd2_rejects_varint_over_ten_bytes() -> None:
+    """expiresIn 编码超过 10 字节 (如 1<<1024): fail-closed, 不得抛 OverflowError."""
+    from plugin import _pb_string, _pb_varint
+
+    huge = b"\xff" * 147 + b"\x01"  # 148 字节 varint, 远超 protobuf 10 字节上限
+    (httpd, base), H = _cd2_server([
+        _pb_string(3, CD2_DIRECT_URL),
+        _pb_varint((2 << 3) | 0) + huge,
+    ])
+    try:
+        assert resolve_mount(_cd2_mount(base), Path("/mnt/115/x.mp4")) is None
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_cd2_rejects_varint_tenth_byte_overflow() -> None:
+    """第 10 字节值位超出 bit63 (64-bit 溢出): fail-closed."""
+    from plugin import _pb_string, _pb_varint
+
+    ten_bytes = b"\xff" * 9 + b"\x02"  # 第 10 字节值位 > 1
+    (httpd, base), H = _cd2_server([
+        _pb_string(3, CD2_DIRECT_URL),
+        _pb_varint((2 << 3) | 0) + ten_bytes,
+    ])
+    try:
+        assert resolve_mount(_cd2_mount(base), Path("/mnt/115/x.mp4")) is None
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_cd2_max_uint64_expires_in_ok() -> None:
+    """合法 10 字节 varint (2^64-1): 正常解析且不抛异常."""
+    from plugin import _pb_string, _pb_varint
+
+    (httpd, base), H = _cd2_server([
+        _pb_string(3, CD2_DIRECT_URL),
+        _pb_varint((2 << 3) | 0) + b"\xff" * 9 + b"\x01",
+    ])
+    try:
+        target = resolve_mount(_cd2_mount(base), Path("/mnt/115/x.mp4"))
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+    assert target is not None
+    assert target.expires_in == float(2**64 - 1)
+
+
+@pytest.mark.parametrize(
+    "content_type",
+    [
+        'video/mp4; x="a"b"',   # 引号内裸双引号
+        'video/mp4; x="a\rb"',  # 引号内 CR 控制字符
+        'video/mp4; x="a\\"',   # 不完整转义 (反斜杠收尾)
+        'video/mp4; x="abc',     # 未闭合引号
+    ],
+)
+def test_verify_rejects_malformed_quoted_string(content_type: str) -> None:
+    """quoted-string 严格校验: 裸引号/控制字符/残缺转义/未闭合一律拒绝."""
+
+    class H(_NoContentTypeHandler):
+        pass
+
+    httpd, base = _start_server(H)
+    H.routes = {"/x": {"status": 206, "content_type": content_type}}
+    try:
+        assert _verify_target(MountTarget(url=f"{base}/x", headers={})) is None
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_verify_accepts_valid_quoted_string() -> None:
+    """合法 quoted-string 参数 (含转义与逗号) 仍放行."""
+    from plugin import _is_valid_media_param
+
+    assert _is_valid_media_param('codecs="avc1.42E01E,mp4a.40.2"')
+    assert _is_valid_media_param('x="a\\"b"')
+    assert _is_valid_media_param('x=""')

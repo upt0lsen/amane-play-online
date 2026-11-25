@@ -1177,7 +1177,22 @@ def _is_valid_media_param(param: str) -> bool:
     value = value.strip()
     if not value:
         return False
-    if len(value) >= 2 and value.startswith('"') and value.endswith('"'):
+    if len(value) >= 2 and value.startswith('"'):
+        # quoted-string 严格校验 (RFC 7230): 内部不得有裸双引号/控制字符,
+        # 转义必须完整, 收尾引号必须是最后一个字符 —— 仅凭首尾引号不放行.
+        if not value.endswith('"'):
+            return False
+        inner = value[1:-1]
+        i = 0
+        while i < len(inner):
+            ch = inner[i]
+            if ch == "\\":
+                i += 1
+                if i >= len(inner) or ord(inner[i]) < 0x20 or ord(inner[i]) == 0x7F:
+                    return False
+            elif ch == '"' or ord(ch) < 0x20 or ord(ch) == 0x7F:
+                return False
+            i += 1
         return True
     return all(ch in _MEDIA_TOKEN_CHARS or ch == "," for ch in value)
 
@@ -1403,14 +1418,19 @@ def _pb_varint(value: int) -> bytes:
 
 def _pb_varint_decode(buf: bytes, pos: int) -> tuple[int, int]:
     result = shift = 0
-    while pos < len(buf):
+    # protobuf varint 上限 10 字节 (64-bit); 第 10 字节仅允许 bit63, 且不得延续.
+    for _ in range(10):
+        if pos >= len(buf):
+            raise ValueError("cd2: truncated varint")
         byte = buf[pos]
         pos += 1
+        if shift == 63 and (byte & 0x7E):
+            raise ValueError("cd2: varint overflow")
         result |= (byte & 0x7F) << shift
         if not (byte & 0x80):
             return result, pos
         shift += 7
-    raise ValueError("cd2: truncated varint")
+    raise ValueError("cd2: varint too long")
 
 
 def _pb_len_delim(field: int, data: bytes) -> bytes:
@@ -1595,7 +1615,15 @@ def _clouddrive2_target(mount: MountConfig, remote: str) -> MountTarget | None:
         return None
     if expires_raw is not None and expires_raw <= 0:
         return None
-    expires_in = float(expires_raw) if expires_raw is not None else None
+    if expires_raw is not None:
+        try:
+            expires_in = float(expires_raw)
+        except OverflowError:
+            return None
+        if not math.isfinite(expires_in):
+            return None
+    else:
+        expires_in = None
     headers: dict[str, str] = {}
     if agent:
         headers["User-Agent"] = agent

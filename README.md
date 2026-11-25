@@ -77,7 +77,7 @@ upt0lsen.play-online/
 | webdav 用户名 / 密码 | `PLAYONLINE_WEBDAV_USER_MEDIA_MYCLOUD` / `PLAYONLINE_WEBDAV_PASS_MEDIA_MYCLOUD` |
 | clouddrive2 令牌 | `PLAYONLINE_CD2_TOKEN_MEDIA_MYCLOUD` |
 
-注意：容器环境变量在启动时固定，轮换凭据需重建容器；**写入配置文件的 token 会被持久化保存，任何能读到配置文件的人都能读回明文**。因此敏感凭据务必走环境变量注入，配置文件里只放地址、前缀、开关等非敏感项；`token` 字段仅为本地/测试场景的兑底，不建议在生产配置中使用。
+注意：容器环境变量在启动时固定，轮换凭据需重建容器；**写入配置文件的 token 会被持久化保存，任何能读到配置文件的人都能读回明文**。因此敏感凭据务必走环境变量注入，配置文件里只放地址、前缀、开关等非敏感项；`token` 字段仅为本地/测试场景的兜底，不建议在生产配置中使用。
 
 ### CloudDrive2 令牌要求
 
