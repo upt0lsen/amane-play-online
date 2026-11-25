@@ -1,0 +1,10 @@
+amane-play-online - 网盘挂载播放源插件 for Amane
+衍生自社区样本插件 "nas.local" 的 plugin.py v1.0.28。
+原始版权归原样本作者所有；本仓库作者于 2026-11-20 起在其基础上修改，
+修改记录见仓库 git 历史与 PR 讨论。
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version. See the LICENSE file for the full
+text of GPL-3.0.
