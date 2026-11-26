@@ -2347,7 +2347,7 @@ def _session_key(
     target_height: int = 0,
     codec: str = "hevc",
     *,
-    source_token: str = "",
+    source_id: str = "",
     headers: dict[str, str] | None = None,
     duration: float = 0.0,
     source_height: int = 0,
@@ -2355,9 +2355,11 @@ def _session_key(
 ) -> str:
     """一条流对应的转码会话标识: 来源变了、参数变了或清晰度档位变了就重新建会话.
 
-    会话命令 (make_command) 闭包持有产生它的 SourceContext, 所以**来源身份必须
-    进 key**: 否则两次 resolve 拿到同一条 URL 但来源不同 (换过签名/请求头) 时会复用
-    旧会话, 续签回调仍绑在旧来源上 (force_refresh 打在新对象, 命令却查旧对象).
+    来源身份用**稳定标识** (本机路径), 不能用每次 resolve 都新生成的随机 token:
+    随机 token 会让同一条流每次 resolve 都算出不同的 key, 于是缓存目录名跟着变
+    (分片永不命中)、同一文件反复起转 ffmpeg, 还会把 MAX_SESSIONS 槽位占满互杀.
+    跨来源的正确做法是"完整重绑": 复用会话时把命令闭包与 session.source 一起
+    指向当前来源 (见 StreamServer.session_for 的 holder 重绑), 而不是靠 key 隔开.
     请求头/时长/宽高/帧率也一并进 key: 元数据变了就该重建会话, 不能复用旧分片.
     """
     codec_tag = f"{codecs.video if codecs else ''}/{codecs.audio if codecs else ''}"
@@ -2373,8 +2375,8 @@ def _session_key(
             codec,
             # 解码链路标记: 由软解/`-hwaccel cuda` 换成显式 CUVID 后, 旧分片缓存必须作废.
             "dec-cuda",
-            # 来源身份与元数据: 任何一项不同都不是同一条流, 不能复用同一个会话.
-            source_token,
+            # 稳定来源身份与元数据: 任一不同就不是同一条流, 不能复用同一个会话.
+            source_id,
             header_tag,
             f"{duration:.3f}",
             str(source_height),
@@ -2584,6 +2586,9 @@ class TranscodeSession:
         self.desired: int | None = None
         #: 所属播放源 (session_for 建立回链): 起转秒退时据此强制直链续签.
         self.source = None
+        #: 命令闭包解引用用的来源持有者 (可重绑): 会话被后续 resolve 复用时,
+        #: 这里指向当前来源, 避免闭包绑死旧 SourceContext.
+        self.source_holder = None
         #: 会话已被回收: 之后的清单与分片请求都必须失败.
         self.stopped = False
         #: 本轮起转的时刻与序号. 用于识别"刚起转、正在出片"的窗口 —— 窗口内不许
@@ -2935,17 +2940,24 @@ class StreamServer:
             self._purged = True
             await asyncio.to_thread(_purge_cache, source.cache_root)
 
+        # 命令闭包**不捕获**某个 SourceContext, 而是通过 holder 在执行时取当前来源:
+        # 同一条流被后续 resolve 复用时 holder 会被重绑到新来源, 于是续签的
+        # force_refresh 打在新对象上、命令查的也是新对象 —— 既能复用会话与缓存目录,
+        # 又不会出现"命令绑旧来源"的错配.
+        holder: dict = {"source": source}
+
         def make_command(start_index: int) -> list[str]:
             # 起转/重转 (含拖动 -ss 重起) 前: 直链临期或被拒则先续签, 续签失败回退本机.
-            _refresh_source_url(source)
+            current = holder["source"]
+            _refresh_source_url(current)
             return _ffmpeg_command(
-                source.tools,
-                source.url,
-                source.headers,
-                source.settings,
-                source.codecs,
+                current.tools,
+                current.url,
+                current.headers,
+                current.settings,
+                current.codecs,
                 start_index,
-                source.seconds,
+                current.seconds,
                 target_height=height,
                 codec=codec,
             )
@@ -2961,7 +2973,7 @@ class StreamServer:
                 source.tools.encoder,
                 height,
                 codec,
-                source_token=source.token,
+                source_id=str(source.local_path),
                 headers=source.headers,
                 duration=source.duration,
                 source_height=source.codecs.height if source.codecs else 0,
@@ -2974,11 +2986,14 @@ class StreamServer:
             wait_seconds=STARTUP_TIMEOUT_SECONDS,
             wait_first=wait_first,
         )
-        # 只有同一个来源才允许改写: 跨来源复用会话会让 make_command 闭包与
-        # session.source 指向不同的 SourceContext (续签 force_refresh 打在新对象上,
-        # 命令却检查旧对象). 会话 key 已含来源 token, 这里只是兜底.
-        if session.source is None or session.source.token == source.token:
-            session.source = source
+        # 复用旧会话时**完整重绑**来源: 命令闭包持有的 holder 与 session.source
+        # 都要指向当前来源. 新建的会话用本次的 holder; 复用的会话必须改写**它原来
+        # 的** holder (换一个新 holder 没用, 旧闭包抓的是旧对象).
+        if session.source_holder is None:
+            session.source_holder = holder
+        else:
+            session.source_holder["source"] = source
+        session.source = source
         source.sessions[(height, codec)] = session
         return session
 

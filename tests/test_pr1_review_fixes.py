@@ -243,7 +243,7 @@ async def test_probe_rejects_dot_segment_without_codec_probe(tmp_path, monkeypat
 
 
 def test_session_key_separates_sources_and_metadata():
-    """会话标识必须含来源身份与元数据, 否则会跨来源复用旧会话."""
+    """会话标识必须含稳定来源身份与元数据, 且同一来源身份算出同一个 key."""
     settings = PluginSettings(mounts=[])
     codecs = MediaCodecs("h264", 1080, "aac", 3600.0, fps=25.0)
     common = {
@@ -255,27 +255,32 @@ def test_session_key_separates_sources_and_metadata():
         "codec": "hevc",
     }
     base = _session_key(
-        **common, source_token="tok-a", headers={}, duration=10.0, source_height=1080, fps=25.0
+        **common, source_id="/mnt/a.mkv", headers={}, duration=10.0, source_height=1080, fps=25.0
     )
+    # 稳定来源身份 -> key 必须稳定 (同一条流要能复用会话与缓存目录).
+    same_source = _session_key(
+        **common, source_id="/mnt/a.mkv", headers={}, duration=10.0, source_height=1080, fps=25.0
+    )
+    assert base == same_source
     other_source = _session_key(
-        **common, source_token="tok-b", headers={}, duration=10.0, source_height=1080, fps=25.0
+        **common, source_id="/mnt/b.mkv", headers={}, duration=10.0, source_height=1080, fps=25.0
     )
     other_headers = _session_key(
         **common,
-        source_token="tok-a",
+        source_id="/mnt/a.mkv",
         headers={"User-Agent": "x"},
         duration=10.0,
         source_height=1080,
         fps=25.0,
     )
     other_duration = _session_key(
-        **common, source_token="tok-a", headers={}, duration=11.0, source_height=1080, fps=25.0
+        **common, source_id="/mnt/a.mkv", headers={}, duration=11.0, source_height=1080, fps=25.0
     )
     other_height = _session_key(
-        **common, source_token="tok-a", headers={}, duration=10.0, source_height=720, fps=25.0
+        **common, source_id="/mnt/a.mkv", headers={}, duration=10.0, source_height=720, fps=25.0
     )
     other_fps = _session_key(
-        **common, source_token="tok-a", headers={}, duration=10.0, source_height=1080, fps=50.0
+        **common, source_id="/mnt/a.mkv", headers={}, duration=10.0, source_height=1080, fps=50.0
     )
     assert base != other_source
     assert base != other_headers
@@ -284,33 +289,84 @@ def test_session_key_separates_sources_and_metadata():
     assert base != other_fps
 
 
-@pytest.mark.asyncio
-async def test_session_for_keys_session_by_source_token(tmp_path, monkeypatch):
-    """session_for 生成的会话标识必须带上来源 token."""
-    server = StreamServer()
-    captured = []
+class _FakeProcess:
+    """假 ffmpeg 进程: 只提供插件用到的接口 (terminate/kill 由插件对象方法驱动, 不发信号)."""
 
-    async def fake_open_session(**kwargs):
-        captured.append(kwargs["key"])
-        raise RuntimeError("stop-before-spawn")
+    def __init__(self, *args, **kwargs) -> None:
+        self.pid = 999999
+        self.returncode = None
 
-    monkeypatch.setattr(server, "open_session", fake_open_session)
-    source = plugin_module.SourceContext(
-        token="tok-abc",
-        cache_root=tmp_path,
-        url="http://cdn/a.mkv",
+    def poll(self):
+        return self.returncode
+
+    def terminate(self) -> None:
+        self.returncode = 0
+
+    def kill(self) -> None:
+        self.returncode = -9
+
+    def wait(self, timeout=None):
+        return self.returncode
+
+
+def _stream_source(tmp_path: Path, token: str, url: str = "http://cdn/a.mkv"):
+    return plugin_module.SourceContext(
+        token=token,
+        cache_root=tmp_path / "cache",
+        url=url,
         headers={},
         local_path=tmp_path / "a.mkv",
         codecs=HEVC_AAC,
-        duration=10.0,
+        duration=3600.0,
         seconds=4.0,
         settings=PluginSettings(mounts=[]),
         tools=Tools(ffmpeg=Path("/usr/bin/ffmpeg"), encoder="libx264"),
         subtitles=(),
     )
-    with pytest.raises(RuntimeError):
-        await server.session_for(source, 1080)
-    assert captured and "tok-abc" in captured[0]
+
+
+@pytest.mark.asyncio
+async def test_same_file_reuses_one_session_and_cache_dir(tmp_path, monkeypatch):
+    """同一文件连续 resolve N 次: 只起转 1 次 ffmpeg, 只有 1 个会话与 1 个缓存目录.
+
+    回归: 会话 key 一旦掺入每次 resolve 都变的随机 token, 就会出现同源重复转码,
+    缓存目录名跟着变 (分片永不命中), 还会把 MAX_SESSIONS 槽位占满互杀.
+    """
+    server = StreamServer()
+    started = []
+
+    def fake_popen(command, *args, **kwargs):
+        started.append(command)
+        return _FakeProcess()
+
+    monkeypatch.setattr(plugin_module.subprocess, "Popen", fake_popen)
+    sessions = []
+    for index in range(4):
+        source = _stream_source(tmp_path, f"tok-{index}")
+        sessions.append(await server.session_for(source, 1080, wait_first=False))
+    assert len(started) == 1, f"同一文件只应起转 1 次, 实际 {len(started)}"
+    assert len(server._sessions) == 1
+    assert len({session.directory for session in sessions}) == 1
+    cache_root = tmp_path / "cache"
+    dirs = [item for item in cache_root.iterdir() if item.is_dir()]
+    assert len(dirs) == 1, f"缓存目录应恒定 1 个, 实际 {len(dirs)}"
+    await server.aclose()
+
+
+@pytest.mark.asyncio
+async def test_reused_session_command_uses_current_source(tmp_path, monkeypatch):
+    """会话被后续 resolve 复用时, 命令必须用当前来源 (完整重绑, 不绑旧 SourceContext)."""
+    server = StreamServer()
+    monkeypatch.setattr(plugin_module.subprocess, "Popen", lambda *a, **k: _FakeProcess())
+    first = _stream_source(tmp_path, "tok-a")
+    session = await server.session_for(first, 1080, wait_first=False)
+    second = _stream_source(tmp_path, "tok-b")
+    second.force_refresh = True
+    second.refresher = lambda: ("http://cdn/a.mkv?new=1", {}, None)
+    reused = await server.session_for(second, 1080, wait_first=False)
+    assert reused is session, "同一文件必须复用同一个会话"
+    command = reused.make_command(0)
+    assert "http://cdn/a.mkv?new=1" in command, "命令必须用当前来源 (续签后的新直链)"
     await server.aclose()
 
 
