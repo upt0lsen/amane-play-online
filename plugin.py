@@ -1244,12 +1244,17 @@ def _has_dot_segments(path: Path) -> bool:
 
 
 def _has_dot_segments_raw(raw: str) -> bool:
-    """原始路径字符串里的 ``.`` / ``..`` 段.
+    r"""原始路径字符串里的 ``.`` / ``..`` 段.
 
     ``Path`` 构造时会归一化掉 ``./`` 与中间的 ``x/../``, 只靠 ``Path.parts`` 会漏判,
     所以必须在归一化之前对原始字符串判一次.
+
+    反斜杠同样按路径分隔符处理: 只按 ``/`` 切分时, Windows 风格的
+    ``C:\..`` 整条路径不含 ``..`` 段, 能整条绕过检查. 盘符 (``C:``) 本身
+    不是 ``.`` / ``..`` 段, 不会被误判; 普通文件名 (``movie.mkv``) 也不受影响.
     """
-    return any(part in (".", "..") for part in raw.split("/"))
+    normalized = raw.replace("\\", "/")
+    return any(part in (".", "..") for part in normalized.split("/"))
 
 
 def _strip_sensitive(headers: dict[str, str]) -> dict[str, str]:
@@ -1529,6 +1534,27 @@ _GRPC_MAX_BODY = 4 * 1024 * 1024
 _GRPC_CONTENT_TYPES = frozenset({"application/grpc-web", "application/grpc-web+proto"})
 
 
+def _grpc_content_type_allowed(headers) -> bool:
+    """gRPC-web 应答 Content-Type 严格判定: 取**全部**值逐个过白名单, 任一不合法就整体拒绝.
+
+    ``headers.get()`` 只返回**第一个**匹配值, 于是"合法在前、伪造在后"的重复头会被
+    整体放行; 这里用 ``get_all()`` 取全部值逐一校验. 缺 Content-Type 一律拒绝
+    (fail-closed).
+    """
+    getter = getattr(headers, "get_all", None)
+    if getter is not None:
+        values = list(getter("Content-Type") or [])
+    else:
+        single = headers.get("Content-Type")
+        values = [single] if single else []
+    if not values:
+        return False
+    for raw in values:
+        if raw.split(";")[0].strip().casefold() not in _GRPC_CONTENT_TYPES:
+            return False
+    return True
+
+
 def _cd2_grpc_unary(address: str, method: str, message: bytes, token: str) -> tuple[bytes, int] | None:
     """gRPC-web+proto 一元调用 (stdlib urllib). 返回 (protobuf 响应, grpc-status); 任何异常 None.
 
@@ -1554,9 +1580,9 @@ def _cd2_grpc_unary(address: str, method: str, message: bytes, token: str) -> tu
     except (OSError, ValueError, TimeoutError, urllib.error.URLError):
         return None
     with contextlib.closing(response):
-        content_type = (response.headers.get("Content-Type") or "").split(";")[0].strip().casefold()
-        # 精确白名单: startswith 会把 "application/grpc-web-evil" 这类伪造类型一并放行.
-        if content_type not in _GRPC_CONTENT_TYPES:
+        # 取**全部** Content-Type 值逐个过精确白名单: 只看第一个值时,
+        # "合法在前、伪造在后"的重复头会被整体放行.
+        if not _grpc_content_type_allowed(response.headers):
             return None
         try:
             body = response.read(_GRPC_MAX_BODY + 1)
@@ -2800,6 +2826,29 @@ def _refresh_source_url(source: "SourceContext") -> None:
     source.refresher = None
 
 
+def _renew_source(source: "SourceContext") -> bool:
+    """强制续签直链 (首次起转失败时用): 换新 URL/请求头, 成功返回 True.
+
+    与 ``_refresh_source_url`` 的区别: 这里**不消费** ``force_refresh`` 标志
+    (置位由调用方负责), 也不在失败时回退本机路径 —— 回退策略交给调用方决定.
+    """
+    if source.refresher is None:
+        return False
+    fresh = None
+    try:
+        fresh = source.refresher()
+    except Exception:  # noqa: BLE001 - 续签异常不允许炸掉播放
+        logger.exception("direct url refresh failed")
+    if fresh is None:
+        logger.warning("直链续签失败: %s", source.local_path)
+        return False
+    url, headers, expires_in = fresh
+    source.url = url
+    source.headers = dict(headers)
+    source.url_expires_at = (time.monotonic() + expires_in) if expires_in else None
+    return True
+
+
 @dataclass
 class SourceContext:
     """一次 resolve 注册的"来源级"播放源.
@@ -2985,6 +3034,7 @@ class StreamServer:
             idle_seconds=float(source.settings.idle_timeout),
             wait_seconds=STARTUP_TIMEOUT_SECONDS,
             wait_first=wait_first,
+            source=source,
         )
         # 复用旧会话时**完整重绑**来源: 命令闭包持有的 holder 与 session.source
         # 都要指向当前来源. 新建的会话用本次的 holder; 复用的会话必须改写**它原来
@@ -3008,6 +3058,7 @@ class StreamServer:
         idle_seconds: float,
         wait_seconds: float,
         wait_first: bool = True,
+        source: SourceContext | None = None,
     ) -> TranscodeSession:
         await self._ensure_started()
         if not self._purged:
@@ -3024,15 +3075,50 @@ class StreamServer:
             else:
                 existing.touch()
         session = existing
+        # 来源回链必须建立在**等第一段之前**: 首段等不到时, 才知道该向谁续签.
+        if source is not None:
+            session.source = source
+        elif session.source is None:
+            session.source = self._match_source(cache_root, duration, seconds)
         if wait_first and not session.complete:
             if not session.alive():
                 # 复用的会话里 ffmpeg 早已退出 (空闲被回收): 重新起转再等第一段.
                 await self._restart(session, 0)
             # 新会话: 等第一段写出来, 播放器才有东西可请求.
             if not await self._wait_segment(session, 0, wait_seconds):
+                # 首次起转就失败: 多半是签名直链被 CDN 以 401/403 拒绝 (签名已过期).
+                # 有 refresher 就先强制续签换新签名, 再重起一次; 续签后仍失败才回退.
+                owner = session.source
+                if owner is not None and owner.refresher is not None:
+                    owner.force_refresh = True
+                    _renew_source(owner)
+                    restarted = await self._restart(session, 0, force=True)
+                    if restarted and await self._wait_segment(session, 0, wait_seconds):
+                        session.touch()
+                        return session
                 await self._stop(session)
                 raise SourceError(FailureReason.NO_USABLE_METADATA, detail="转码失败, 无法解码该来源")
         return session
+
+    def _match_source(
+        self, cache_root: Path, duration: float, seconds: float
+    ) -> SourceContext | None:
+        """按 (缓存目录, 时长, 分片长) 反查来源.
+
+        正常路径由 ``session_for`` 显式传入来源; 只有直接调用 ``open_session``
+        (测试/探针) 才会走这个兜底 —— 首段等不到时需要知道该向谁续签.
+        """
+        for source in self._tokens.values():
+            if source.refresher is None:
+                continue
+            if source.cache_root != cache_root:
+                continue
+            if abs(source.duration - duration) > 0.001:
+                continue
+            if abs(source.seconds - seconds) > 0.001:
+                continue
+            return source
+        return None
 
     def _spawn(
         self,
@@ -4172,6 +4258,21 @@ class OnlineProvider(PlaybackProvider):
     async def probe(self, query: PlaybackQuery) -> tuple[PlaybackOffer, ...]:
         if not query.files:
             return ()
+        # 原始路径校验必须**先于** _resolve_tools: _resolve_tools 会真的跑 ffmpeg
+        # 探测编码器能力, 越界路径在拒绝之前就起过 ffmpeg, 等于把越界文件喂给了
+        # 外部程序. 只要有一个文件越界, 整批都不探测 (fail-closed), 一次 ffmpeg 都不起.
+        if any(_has_dot_segments_raw(item.path) for item in query.files):
+            return tuple(
+                PlaybackOffer(
+                    key=_stream_key(item.id),
+                    name=Path(item.path).name,
+                    content_type=DIRECT_TYPES.get(Path(item.path).suffix.casefold()) or "video/mp4",
+                    seekable=True,
+                    unavailable="路径不合法",
+                    subtitles=(),
+                )
+                for item in query.files
+            )
         tools = await self._resolve_tools()
 
         async def build(item: PlaybackMediaFile) -> PlaybackOffer:

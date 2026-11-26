@@ -672,3 +672,188 @@ def test_restart_spawn_oserror_returns_none(tmp_path, monkeypatch):
     (tmp_path / plugin_module.PID_FILE).write_text("123\nffmpeg\n", encoding="utf-8")
     assert plugin_module.StreamServer._spawn_process(session, 0) is None
     assert not (tmp_path / plugin_module.PID_FILE).exists()
+
+
+# ---------------------------------------------------------------------------
+# 第2轮: probe 前置校验 / 反斜杠 dot 段 / gRPC 重复头 / 首次起转续签
+# ---------------------------------------------------------------------------
+
+BS = chr(92)
+
+
+@pytest.mark.asyncio
+async def test_probe_rejects_dot_segment_without_running_ffmpeg(tmp_path, monkeypatch):
+    """probe() 必须先校验原始路径: 拒绝越界路径时一次子进程都不能起.
+
+    刻意**不打桩** _resolve_tools: 它会真的跑 ffmpeg 探测编码器能力, 打桩了这条
+    断言就成了假绿.
+    """
+    calls = []
+
+    def fake_popen(command, *args, **kwargs):
+        calls.append(command)
+        raise OSError("test: ffmpeg 不该被起")
+
+    monkeypatch.setattr(plugin_module.subprocess, "Popen", fake_popen)
+    context = PluginContext(
+        source_id="upt0lsen.play-online",
+        http_client=None,
+        web_client=None,
+        data_dir=tmp_path / "plugin-data",
+    )
+    provider = plugin_module.OnlineProvider(context, PluginSettings())
+    provider._tools_ready = False
+    item = PlaybackMediaFile(id=1, path="/mnt/evil/../outside/movie.mkv")
+    query = PlaybackQuery(metadata_id=1, number="1", files=(item,))
+    offers = await provider.probe(query)
+    assert len(offers) == 1
+    assert offers[0].unavailable == "路径不合法"
+    assert calls == [], f"拒绝越界路径前不得起任何子进程, 实际起了 {calls}"
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "/mnt/evil/../outside/movie.mkv",
+        BS + BS + "mnt" + BS + "evil" + BS + ".." + BS + "outside" + BS + "movie.mkv",
+        "C:" + BS + "mnt" + BS + "evil" + BS + ".." + BS + "outside" + BS + "movie.mkv",
+        "C:" + BS + "mnt" + BS + "evil" + BS + "." + BS + "movie.mkv",
+    ],
+)
+def test_dot_segments_raw_rejects_backslash_forms(raw):
+    """反斜杠形式的 . / .. 段同样必须判越界."""
+    assert plugin_module._has_dot_segments_raw(raw) is True
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "/mnt/a/movie.mkv",
+        "C:/mnt/a/movie.mkv",
+        "C:" + BS + "mnt" + BS + "a" + BS + "movie.mkv",
+        "/mnt/a.b/movie.mkv",
+    ],
+)
+def test_dot_segments_raw_accepts_normal_paths(raw):
+    """正常路径不能被误判 (盘符与普通文件名里的点都不是 . 段)."""
+    assert plugin_module._has_dot_segments_raw(raw) is False
+
+
+class _DuplicateCtHandler(BaseHTTPRequestHandler):
+    """可发送多个 Content-Type 的 gRPC-web 桩 (重复头绕过复现)."""
+
+    content_types: list = []
+
+    def do_POST(self) -> None:  # noqa: N802
+        length = int(self.headers.get("Content-Length", "0"))
+        self.rfile.read(length)
+        payload = bytes([0x08, 0x01])
+        frame = bytes([0x00]) + struct.pack(">I", len(payload)) + payload
+        trailer_text = b"grpc-status: 0" + bytes([13, 10, 13, 10])
+        trailer = bytes([0x80]) + struct.pack(">I", len(trailer_text)) + trailer_text
+        out = frame + trailer
+        self.send_response(200)
+        for value in type(self).content_types:
+            self.send_header("Content-Type", value)
+        self.send_header("Content-Length", str(len(out)))
+        self.end_headers()
+        self.wfile.write(out)
+
+    def log_message(self, *args) -> None:
+        pass
+
+
+def _grpc_call_with_types(content_types: list):
+    import socketserver
+
+    class H(_DuplicateCtHandler):
+        pass
+
+    H.content_types = list(content_types)
+    httpd = socketserver.TCPServer(("127.0.0.1", 0), H)
+    httpd.timeout = 5
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{httpd.server_address[1]}"
+    try:
+        return plugin_module._cd2_grpc_unary(
+            base, "/cd2.v1.CloudDrive2/GetDownloadUrlPath", b"", "tok"
+        )
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_grpc_duplicate_content_type_rejected():
+    """重复 Content-Type: 合法在前、伪造在后也必须整体拒绝; 缺头也拒绝."""
+    assert _grpc_call_with_types(["application/grpc-web+proto"]) is not None
+    assert _grpc_call_with_types(["application/grpc-web"]) is not None
+    assert _grpc_call_with_types(["application/grpc-web-evil"]) is None
+    assert (
+        _grpc_call_with_types(["application/grpc-web+proto", "application/grpc-web-evil"]) is None
+    )
+    assert (
+        _grpc_call_with_types(["application/grpc-web-evil", "application/grpc-web+proto"]) is None
+    )
+    assert (
+        _grpc_call_with_types(["application/grpc-web", "application/grpc-web+proto"]) is not None
+    )
+    assert _grpc_call_with_types([]) is None
+
+
+@pytest.mark.asyncio
+async def test_first_spawn_failure_triggers_renewal(tmp_path, monkeypatch):
+    """首次起转就失败 (模拟签名被拒 401 秒退): 必须置 force_refresh 并真的续签."""
+
+    class _AliveProc:
+        pid = 999999
+
+        def poll(self):
+            return None  # 进程活着但永远产不出分片
+
+        def terminate(self) -> None:
+            return None
+
+        def kill(self) -> None:
+            return None
+
+        def wait(self, timeout=None):
+            return None
+
+    monkeypatch.setattr(
+        plugin_module.subprocess, "Popen", lambda command, *a, **k: _AliveProc()
+    )
+    refresh_calls = []
+
+    def refresher():
+        refresh_calls.append(1)
+        return ("https://cdn.example.com/movie.mkv?sign=NEW", {}, None)
+
+    server = StreamServer()
+    source = await server.register_source(
+        cache_root=tmp_path / "cache",
+        url="https://cdn.example.com/movie.mkv?sign=OLD",
+        headers={},
+        local_path=tmp_path / "movie.mkv",
+        codecs=HEVC_AAC,
+        duration=120.0,
+        seconds=1.0,
+        settings=PluginSettings(mounts=[]),
+        tools=Tools(ffmpeg=Path("/usr/bin/ffmpeg"), encoder="libx264"),
+        subtitles=(),
+        subtitle_sources={},
+        refresher=refresher,
+    )
+    with pytest.raises(SourceError):
+        await server.open_session(
+            cache_root=source.cache_root,
+            key="probe-key",
+            make_command=lambda index: ["ffmpeg", "-i", "x"],
+            duration=120.0,
+            seconds=1.0,
+            idle_seconds=60.0,
+            wait_seconds=0.2,
+            wait_first=True,
+        )
+    assert refresh_calls, "首次起转失败必须触发续签 (refresher 至少调用一次)"
+    assert source.force_refresh is True, "首次起转失败必须置位 force_refresh"
+    await server.aclose()
