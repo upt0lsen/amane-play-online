@@ -181,6 +181,9 @@ MAX_SESSIONS = 3
 KILL_AFTER_IDLE_SECONDS = 45.0
 #: 清理任务的周期. 只做查询与判断, 很轻.
 SWEEP_SECONDS = 15.0
+
+#: 没有任何活动会话的播放源在闲置多久后被回收 (连带它的签名 URL 与回环 token).
+SOURCE_IDLE_SECONDS = 300.0
 #: 播放头离当前转码位置还有这么多段时按"正在产出"处理, 避免预取请求把转码打入反复重启.
 COVER_MARGIN_SEGMENTS = 6
 #: 当前这一轮 ffmpeg 最多"覆盖"到已产出段之后这么多个段. 播放器顺序预读 30 秒 (8 段) 落在
@@ -575,6 +578,9 @@ class Tools:
     #: h264_qsv 是否真的能跑: 选了 hevc_qsv 时, H.264 兜底档也应该留在核显上,
     #: 否则老浏览器一播就是 libx264 软编.
     h264_qsv: bool = False
+    #: hevc_qsv 是否真的能跑: 只有 h264_qsv 可用时, HEVC 档**不能**想当然地选
+    #: hevc_qsv (那会挑到一个根本跑不起来的编码器); 不可用时软编 libx265.
+    hevc_qsv: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -829,6 +835,12 @@ def _discover_tools(settings: PluginSettings, data_dir: Path) -> Tools | None:
             _encoder_works(ffmpeg, "h264_qsv")
             if qsv and encoder != "h264_qsv"
             else qsv
+        ),
+        # HEVC 核显编码要单独确认: 只有 h264_qsv 可用时 hevc_qsv 可能压根不存在.
+        hevc_qsv=(
+            True
+            if encoder == "hevc_qsv"
+            else (_encoder_works(ffmpeg, "hevc_qsv") if qsv else False)
         ),
     )
 
@@ -1383,6 +1395,9 @@ def _alist_dlink(mount: MountConfig, remote: str) -> str | None:
                 payload = json.loads(response.read().decode("utf-8", "replace"))
             except (OSError, ValueError):
                 return None
+            # 合法 JSON 但不是对象 (数组 / null / 字符串): 不能直接 .get, 按解析失败处理.
+            if not isinstance(payload, dict):
+                return None
         if payload.get("code") != 200:
             return None
         data = payload.get("data")
@@ -1397,7 +1412,7 @@ def _alist_dlink(mount: MountConfig, remote: str) -> str | None:
 
 
 # ---------------------------------------------------------------------------
-# CloudDrive2 gRPC 后端 
+# CloudDrive2 gRPC 后端
 # ---------------------------------------------------------------------------
 # CD2 与 Web/WebDAV 同端口提供 gRPC; 插件环境只有 stdlib+Pydantic (无 grpcio),
 # 因此用 gRPC-web+proto over HTTP/1.1 (urllib) + 手写极简 protobuf 编解码.
@@ -1509,6 +1524,9 @@ def _pb_strict_text(fields: dict[int, list[tuple[int, object]]], field: int) -> 
 #: gRPC-web 应答体上限: GetDownloadUrlPath 应答只有几百字节, 4MB 已是宽限;
 #: 超限一律判失败, 防异常对端撑爆内存.
 _GRPC_MAX_BODY = 4 * 1024 * 1024
+#: gRPC-web 应答 Content-Type 的**精确**白名单: 不用 startswith, 否则
+#: "application/grpc-web-evil" 这类近似伪造的类型也会被放行.
+_GRPC_CONTENT_TYPES = frozenset({"application/grpc-web", "application/grpc-web+proto"})
 
 
 def _cd2_grpc_unary(address: str, method: str, message: bytes, token: str) -> tuple[bytes, int] | None:
@@ -1537,7 +1555,8 @@ def _cd2_grpc_unary(address: str, method: str, message: bytes, token: str) -> tu
         return None
     with contextlib.closing(response):
         content_type = (response.headers.get("Content-Type") or "").split(";")[0].strip().casefold()
-        if not content_type.startswith("application/grpc-web"):
+        # 精确白名单: startswith 会把 "application/grpc-web-evil" 这类伪造类型一并放行.
+        if content_type not in _GRPC_CONTENT_TYPES:
             return None
         try:
             body = response.read(_GRPC_MAX_BODY + 1)
@@ -1895,8 +1914,12 @@ def _video_encoder(tools: Tools, codec: str) -> str:
             return "hevc_nvenc"
         if tools.encoder in NVENC_ENCODERS and tools.hevc_nvenc:
             return "hevc_nvenc"
-        if tools.encoder in QSV_ENCODERS:
+        if tools.encoder in QSV_ENCODERS and tools.hevc_qsv:
             return "hevc_qsv"
+        if tools.encoder in QSV_ENCODERS:
+            # 只有 h264_qsv 可用: HEVC 档软编 libx265 (帧格式必须与编码器配套,
+            # 硬编不可用时落到软编, 不能选一个跑不起来的 hevc_qsv).
+            return "libx265"
         return "libx265"
     if tools.encoder == "h264_nvenc" or (
         tools.encoder in NVENC_ENCODERS and tools.h264_nvenc
@@ -2323,9 +2346,22 @@ def _session_key(
     encoder: str,
     target_height: int = 0,
     codec: str = "hevc",
+    *,
+    source_token: str = "",
+    headers: dict[str, str] | None = None,
+    duration: float = 0.0,
+    source_height: int = 0,
+    fps: float | None = None,
 ) -> str:
-    """一条流对应的转码会话标识: 来源变了、参数变了或清晰度档位变了就重新建会话."""
+    """一条流对应的转码会话标识: 来源变了、参数变了或清晰度档位变了就重新建会话.
+
+    会话命令 (make_command) 闭包持有产生它的 SourceContext, 所以**来源身份必须
+    进 key**: 否则两次 resolve 拿到同一条 URL 但来源不同 (换过签名/请求头) 时会复用
+    旧会话, 续签回调仍绑在旧来源上 (force_refresh 打在新对象, 命令却查旧对象).
+    请求头/时长/宽高/帧率也一并进 key: 元数据变了就该重建会话, 不能复用旧分片.
+    """
     codec_tag = f"{codecs.video if codecs else ''}/{codecs.audio if codecs else ''}"
+    header_tag = "|".join(f"{k.casefold()}:{v}" for k, v in sorted((headers or {}).items()))
     return "|".join(
         [
             url,
@@ -2337,6 +2373,12 @@ def _session_key(
             codec,
             # 解码链路标记: 由软解/`-hwaccel cuda` 换成显式 CUVID 后, 旧分片缓存必须作废.
             "dec-cuda",
+            # 来源身份与元数据: 任何一项不同都不是同一条流, 不能复用同一个会话.
+            source_token,
+            header_tag,
+            f"{duration:.3f}",
+            str(source_height),
+            f"{fps:.3f}" if fps is not None else "",
         ]
     )
 # ---------------------------------------------------------------------------
@@ -2783,6 +2825,9 @@ class SourceContext:
     refresher: "Callable[[], tuple[str, dict[str, str], float | None] | None] | None" = None
     #: 上一次起转秒退 (疑似签名被 CDN 拒绝): 下次构造命令前强制续签.
     force_refresh: bool = False
+    #: 最后一次被使用的时间 (monotonic 秒): 宽限期后仍没有任何活动会话的来源会被
+    #: 回收, 连同它的完整签名 URL 与回环端点 token 一起清掉.
+    last_used: float = field(default_factory=time.monotonic)
     preferred_height: int = 0
     sessions: dict[tuple[int, str], TranscodeSession] = field(default_factory=dict)
 
@@ -2880,6 +2925,7 @@ class StreamServer:
         (见 ``ensure_segment``), 清单根本不需要分片, 所以没必要先等第 0 段 —— 那等于
         每次拖动都白起一次"从 0 开始"的转码再被杀掉重来.
         """
+        source.last_used = time.monotonic()
         session = source.sessions.get((height, codec))
         if session is not None and not session.stopped:
             session.touch()
@@ -2915,6 +2961,11 @@ class StreamServer:
                 source.tools.encoder,
                 height,
                 codec,
+                source_token=source.token,
+                headers=source.headers,
+                duration=source.duration,
+                source_height=source.codecs.height if source.codecs else 0,
+                fps=source.codecs.fps if source.codecs else None,
             ),
             make_command=make_command,
             duration=source.duration,
@@ -2923,7 +2974,11 @@ class StreamServer:
             wait_seconds=STARTUP_TIMEOUT_SECONDS,
             wait_first=wait_first,
         )
-        session.source = source
+        # 只有同一个来源才允许改写: 跨来源复用会话会让 make_command 闭包与
+        # session.source 指向不同的 SourceContext (续签 force_refresh 打在新对象上,
+        # 命令却检查旧对象). 会话 key 已含来源 token, 这里只是兜底.
+        if session.source is None or session.source.token == source.token:
+            session.source = source
         source.sessions[(height, codec)] = session
         return session
 
@@ -2980,16 +3035,22 @@ class StreamServer:
         directory.mkdir(parents=True, exist_ok=True)
         log = directory / "ffmpeg.log"
         command = make_command(0)
-        with log.open("ab") as handle:
-            process = subprocess.Popen(
-                command,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=handle,
-                # 以会话目录为工作目录: 清单里的 seg*.m4s / init.mp4 是相对名字, 必须落在同一处.
-                cwd=str(directory),
-                creationflags=NO_WINDOW,
-            )
+        try:
+            with log.open("ab") as handle:
+                process = subprocess.Popen(
+                    command,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=handle,
+                    # 以会话目录为工作目录: 清单里的 seg*.m4s / init.mp4 是相对名字, 必须落在同一处.
+                    cwd=str(directory),
+                    creationflags=NO_WINDOW,
+                )
+        except OSError as exc:
+            # ffmpeg 起不来 (文件被删/不可执行/资源耗尽): 转成受控失败并清掉半成品
+            # 目录, 不能把 OSError 直接抛到上层 (会变成 500 而不是可回退的失败).
+            shutil.rmtree(directory, ignore_errors=True)
+            raise SourceError(FailureReason.NO_USABLE_METADATA, detail="ffmpeg 启动失败") from exc
         _record_pid(directory, process, command[0])
         return TranscodeSession(
             token=secrets.token_hex(8),
@@ -3046,6 +3107,8 @@ class StreamServer:
                     logger.warning("previous transcode still alive, skip restart (start=%s)", target)
                     return False
                 process = await asyncio.to_thread(self._spawn_process, session, target)
+                if process is None:
+                    return False
                 session.process = process
                 session.encoder_start = target
                 session.desired = target
@@ -3071,7 +3134,10 @@ class StreamServer:
                         # 起转秒退疑似直链签名被 CDN 拒绝 (401/403): 强制续签,
                         # 下一次 _spawn_process 会从当前段用新签名重起.
                         session.source.force_refresh = True
-                    session.process = await asyncio.to_thread(self._spawn_process, session, target)
+                    spawned = await asyncio.to_thread(self._spawn_process, session, target)
+                    if spawned is None:
+                        return False
+                    session.process = spawned
                     session.encoder_start = target
                 session.desired = target
                 return True
@@ -3137,7 +3203,7 @@ class StreamServer:
         session.patched.discard(index)
 
     @staticmethod
-    def _spawn_process(session: TranscodeSession, index: int) -> subprocess.Popen[bytes]:
+    def _spawn_process(session: TranscodeSession, index: int) -> "subprocess.Popen[bytes] | None":
         # 新的一次运行会重写它自己的清单: 先删掉, 免得把上一轮的段号当成这一轮的.
         with contextlib.suppress(OSError):
             session.run_playlist.unlink()
@@ -3146,15 +3212,23 @@ class StreamServer:
         with contextlib.suppress(OSError):
             session.directory.mkdir(parents=True, exist_ok=True)
         command = session.make_command(index)
-        with session.log.open("ab") as handle:
-            process = subprocess.Popen(
-                command,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=handle,
-                cwd=str(session.directory),
-                creationflags=NO_WINDOW,
-            )
+        try:
+            with session.log.open("ab") as handle:
+                process = subprocess.Popen(
+                    command,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=handle,
+                    cwd=str(session.directory),
+                    creationflags=NO_WINDOW,
+                )
+        except OSError as exc:
+            # 重启失败 (ffmpeg 被删/不可执行/资源耗尽): 记日志并清掉残留 pid 文件,
+            # 由调用方按"这次没起转"处理, 不把 OSError 抛给上层.
+            logger.warning("ffmpeg 起转失败 (start=%s): %s", index, exc)
+            with contextlib.suppress(OSError):
+                (session.directory / PID_FILE).unlink()
+            return None
         _record_pid(session.directory, process, command[0])
         return process
 
@@ -3362,6 +3436,20 @@ class StreamServer:
             elif idle > KILL_AFTER_IDLE_SECONDS and session.alive():
                 await asyncio.to_thread(self._terminate_process, session)
                 logger.info("transcode stopped after idle")
+        # 来源级回收: 没有任何活动会话且长时间没人用的来源要一并清掉, 否则反复
+        # resolve 会让 _tokens 一直涨, 完整签名 URL 与回环端点也一直留在内存里.
+        for token, source in list(self._tokens.items()):
+            if source.sessions or any(item.source is source for item in self._sessions.values()):
+                source.last_used = now
+                continue
+            if now - source.last_used <= SOURCE_IDLE_SECONDS:
+                continue
+            self._tokens.pop(token, None)
+            source.url = ""
+            source.headers = {}
+            source.refresher = None
+            source.force_refresh = False
+            logger.info("回收闲置播放源: %s", source.local_path)
 
     async def _sweep(self) -> None:
         while True:
@@ -4074,11 +4162,21 @@ class OnlineProvider(PlaybackProvider):
         async def build(item: PlaybackMediaFile) -> PlaybackOffer:
             raw_path = item.path
             path = Path(raw_path)
+            if _has_dot_segments_raw(raw_path):
+                # 归一化前的原始路径含 . / .. 段: 可能越出挂载点, 一律不播.
+                # 必须先于 _plan (会跑 ffmpeg 探测) / stat / 字幕扫描拒绝: 否则
+                # 最终拒绝之前已经把越界文件探测过一遍了.
+                logger.info("路径含 . / .. 段, 拒绝: %s", raw_path)
+                return PlaybackOffer(
+                    key=_stream_key(item.id),
+                    name=path.name,
+                    content_type=DIRECT_TYPES.get(path.suffix.casefold()) or "video/mp4",
+                    seekable=True,
+                    unavailable="路径不合法",
+                    subtitles=(),
+                )
             plan = await self._plan(path, tools)
             unavailable = plan.unavailable
-            if unavailable is None and _has_dot_segments_raw(raw_path):
-                # 归一化前的原始路径含 . / .. 段: 可能越出挂载点, 一律不播 ().
-                unavailable = "路径不合法"
             if unavailable is None:
                 exists = await asyncio.to_thread(path.is_file)
                 if not exists:
@@ -4221,7 +4319,9 @@ class OnlineProvider(PlaybackProvider):
                 target = await self._verified_target(path, direct=False)
             if target is not None:
                 if not _has_sensitive_headers(target.headers) and not target.headers_untrusted:
-                    refresher = self._make_url_refresher(path) if target.expires_in else None
+                    # 续签回调对所有 HTTP 直链输入都注册: expires_in 只决定"提前续签",
+                    # 不决定"被 CDN 拒绝后能不能强制续签" (AList 签名直链通常没有有效期元数据).
+                    refresher = self._make_url_refresher(path)
                     return target.url, target.headers, target.expires_in, refresher
                 logger.info("直链带敏感/不可信头, 转码输入回退本机路径 (防 ffmpeg 泄露): %s", path)
         return str(path), {}, None, None
@@ -4240,6 +4340,11 @@ class OnlineProvider(PlaybackProvider):
         elif query.files:
             selected = query.files[0]
         else:
+            return None
+        # 与 probe/resolve 同一口径: 原始路径含 . / .. 段一律拒绝, 且必须先于任何
+        # 目录扫描/文件读取 —— 否则会读到挂载点之外的字幕文件.
+        if _has_dot_segments_raw(selected.path):
+            logger.info("字幕请求路径含 . / .. 段, 拒绝: %s", selected.path)
             return None
         video = Path(selected.path)
         for index, (path, suffix) in enumerate(_scan_subtitles(video)):

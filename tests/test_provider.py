@@ -324,7 +324,9 @@ async def test_transcode_input_uses_url_without_credentials(tmp_path, media_serv
     source, headers, expires_in, refresher = await provider._transcode_input(video)
     assert source == f"{base}/signed/a.mkv"
     assert headers == {}
-    assert expires_in is None and refresher is None  # 桩目标无有效期, 不挂续签
+    # 复核修正: 无有效期元数据也要挂续签回调 —— expires_in 只决定"提前续签",
+    # 不决定"被 CDN 拒绝后能不能强制续签" (alist 签名链通常没有有效期元数据).
+    assert expires_in is None and refresher is not None
 
 
 @pytest.mark.asyncio
